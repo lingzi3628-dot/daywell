@@ -55,3 +55,61 @@ export async function callProvider(config: ProviderConfig, system: string, promp
   if (typeof content !== "string" || !content.trim()) throw new Error("The model returned no text. Check that it supports chat completions.");
   return content.trim();
 }
+
+export async function streamProvider(config: ProviderConfig, system: string, prompt: string, history: Msg[], onToken: (token: string) => void, timeout = 55000): Promise<string> {
+  if (!supportedProviders.includes(config.provider) || !config.model.trim() || !config.apiKey.trim()) throw new Error("Provider, model, and API key are required.");
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  let url: string;
+  let body: object;
+  if (config.provider === "Gemini") {
+    url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(config.model)}:streamGenerateContent?alt=sse`;
+    headers["x-goog-api-key"] = config.apiKey;
+    body = { systemInstruction: { parts: [{ text: system }] }, contents: [...history.slice(-12), { role: "user", content: prompt }].map(m => ({ role: m.role === "assistant" ? "model" : "user", parts: [{ text: m.content }] })), generationConfig: { maxOutputTokens: 1600 } };
+  } else {
+    url = config.provider === "Custom" ? await validateEndpoint(config.endpoint || "") : endpoints[config.provider];
+    headers.Authorization = `Bearer ${config.apiKey}`;
+    if (config.provider === "OpenRouter") headers["X-OpenRouter-Title"] = "Daywell";
+    body = { model: config.model, messages: [{ role: "system", content: system }, ...history.slice(-12).map(m => ({ role: m.role, content: m.content })), { role: "user", content: prompt }], max_tokens: 1600, temperature: 0.7, stream: true };
+  }
+  let response: Response;
+  try { response = await fetch(url, { method: "POST", headers, body: JSON.stringify(body), redirect: "error", cache: "no-store", signal: AbortSignal.timeout(timeout) }); }
+  catch (e) {
+    if (e instanceof Error && e.name === "TimeoutError") throw new Error("The AI provider timed out. Try again or choose another model.");
+    throw new Error("Could not reach the AI provider. Check the key, endpoint and network access.");
+  }
+  if (!response.ok) {
+    const result = await response.json().catch(() => null);
+    const detail = result?.error?.message || (typeof result?.error === "string" ? result.error : result?.message);
+    throw new Error(`Provider returned ${response.status}${detail ? `: ${String(detail).slice(0, 250)}` : ". Check the key and model ID."}`);
+  }
+  if (!response.body) throw new Error("The AI provider did not return a readable stream.");
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let full = "";
+  const consume = (line: string) => {
+    if (!line.startsWith("data:")) return;
+    const data = line.slice(5).trim();
+    if (!data || data === "[DONE]") return;
+    try {
+      const parsed = JSON.parse(data);
+      const token = config.provider === "Gemini"
+        ? parsed?.candidates?.[0]?.content?.parts?.map((part: { text?: string }) => part.text || "").join("") || ""
+        : parsed?.choices?.[0]?.delta?.content || "";
+      if (typeof token === "string" && token) { full += token; onToken(token); }
+    } catch { /* Ignore incomplete or provider-specific SSE frames. */ }
+  };
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      buffer += decoder.decode(value, { stream: !done });
+      const lines = buffer.split(/\r?\n/);
+      buffer = lines.pop() || "";
+      lines.forEach(consume);
+      if (done) break;
+    }
+    if (buffer) consume(buffer);
+  } finally { reader.releaseLock(); }
+  if (!full.trim()) throw new Error("The model returned no text. Check that it supports streamed chat completions.");
+  return full.trim();
+}

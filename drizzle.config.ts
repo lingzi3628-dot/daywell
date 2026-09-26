@@ -1,7 +1,7 @@
 import "dotenv/config";
 import { defineConfig } from "drizzle-kit";
 
-const url = process.env.DATABASE_URL || process.env.DATABASE_URL_POOLED;
+const url = process.env.DATABASE_URL_UNPOOLED || process.env.DATABASE_URL || process.env.DATABASE_URL_POOLED || process.env.POSTGRES_URL_NON_POOLING || process.env.POSTGRES_URL;
 if (!url) throw new Error("Set DATABASE_URL (preferred) or DATABASE_URL_POOLED before running Drizzle Kit.");
 
 export default defineConfig({

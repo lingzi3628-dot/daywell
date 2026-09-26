@@ -18,7 +18,7 @@ Daywell is an installable, responsive productivity app built with Next.js, React
 
 ## Deploy
 
-Deploy as a Node.js Next.js application on a host that supports Next.js server routes. Configure `DATABASE_URL_POOLED` and `ENCRYPTION_KEY` as server-side environment variables. Set `DATABASE_URL` to the direct Neon connection string for migration jobs. Never put database, storage, or AI secrets in `NEXT_PUBLIC_*` variables or commit them to source control. Run `npm run db:migrate` as a release step before serving a new version.
+Deploy as a Node.js Next.js application on a host that supports Next.js server routes. Configure `DATABASE_URL_POOLED` (or the Neon Vercel integration's `DATABASE_URL` / `POSTGRES_URL`) and `ENCRYPTION_KEY` as server-side environment variables. Set `DATABASE_URL_UNPOOLED` or `DATABASE_URL` to the direct Neon connection string for migrations. Never put database, storage, or AI secrets in `NEXT_PUBLIC_*` variables or commit them to source control. Run `npm run db:migrate` as a release step before serving a new version.
 
 The app can be installed from a supported browser's menu after it is served over HTTPS. Its web app manifest and app icon are in `public/`.
 
@@ -27,6 +27,12 @@ The app can be installed from a supported browser's menu after it is served over
 To create a shareable Android APK, first deploy the web/API app and set `EXPO_PUBLIC_API_URL` in the EAS build environment to its HTTPS origin. From `mobile/`, run `npx eas-cli login`, `npx eas-cli init` once, then `npx eas-cli build --platform android --profile preview`. The preview profile produces an installable APK; EAS provides a download link when the build finishes. On Android, open that link and allow installation from the browser if prompted. The APK uses your deployed Daywell backend for registration, sign-in, and synced workspace data.
 
 For a quick first release, the web app is already installable from the browser menu after deployment. Users can also download their signed-in workspace as JSON from **Settings → Account → Download my data**. The export includes goals, tasks, reminders, writing, check-ins, focus history, and connection details, but never API keys or session credentials.
+
+## Policies, AI and updates
+
+Terms of Service and Privacy Policy are available at `/terms` and `/privacy`. They identify Baby Seven as the operator and use the support WhatsApp number supplied by the owner. AI companion replies stream as they are generated on web and mobile; provider streaming support is required for token-by-token output. OpenAI-compatible providers and Gemini are supported.
+
+Signed-in web workspaces refresh every 12 seconds while the page is visible. Mobile refreshes every 20 seconds while the app is active. Browser reminder notifications are delivered while the web app is open and notification permission is granted. These are near-live refreshes and foreground reminders; background push delivery needs a configured push provider and a scheduler. Vercel Hobby cron jobs are limited to one execution per day, so they cannot provide minute-accurate reminder delivery.
 
 ## Environment variables
 

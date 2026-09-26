@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useMemo, useState, type ComponentProps } from "react";
 import {
-  ActivityIndicator, Alert, KeyboardAvoidingView, Modal, Platform, Pressable,
+  ActivityIndicator, Alert, AppState, KeyboardAvoidingView, Modal, Platform, Pressable,
   RefreshControl, ScrollView, StatusBar, StyleSheet, Text, TextInput, View,
 } from "react-native";
 import * as SecureStore from "expo-secure-store";
+import { fetch as expoFetch } from "expo/fetch";
 import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
 
 const API_URL = (process.env.EXPO_PUBLIC_API_URL || "").replace(/\/$/, "");
@@ -90,6 +91,13 @@ export default function App() {
   // This runs once on app launch to restore the secure device session.
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    if (!token || offlinePreview) return;
+    const timer = setInterval(() => { if (AppState.currentState === "active") void refresh(); }, 20000);
+    const appState = AppState.addEventListener("change", state => { if (state === "active") void refresh(); });
+    return () => { clearInterval(timer); appState.remove(); };
+  }, [token, offlinePreview, refresh]);
 
   const load = async () => {
     setRefreshing(true); setError("");
@@ -179,10 +187,39 @@ export default function App() {
       setData(current => ({ ...current, messages: [...current.messages, { id: `preview-user-${Date.now()}`, role: "user", content: prompt, createdAt: stamp }, { id: `preview-assistant-${Date.now()}`, role: "assistant", content: "Let’s make this manageable. What’s one small action you could finish in the next 10 minutes?", createdAt: stamp }] }));
       setBusy(false); return;
     }
+    const stamp = new Date().toISOString();
+    const userMessage: Message = { id: "stream-user", role: "user", content: prompt, createdAt: stamp };
+    const assistantMessage: Message = { id: "stream-assistant", role: "assistant", content: "", createdAt: stamp };
+    setData(current => ({ ...current, messages: [...current.messages, userMessage, assistantMessage] }));
     try {
-      await request("/api/ai", token, { method: "POST", body: JSON.stringify({ action: "chat", input: prompt }) });
-      await refresh();
-    } catch (e) { setError(e instanceof Error ? e.message : "Could not send your message."); setChatText(prompt); }
+      const headers = new Headers({ "Content-Type": "application/json" });
+      if (token) headers.set("Authorization", `Bearer ${token}`);
+      const response = await expoFetch(`${API_URL}/api/ai`, { method: "POST", headers, body: JSON.stringify({ action: "chat-stream", input: prompt }) });
+      if (!response.ok) { const body = await response.json().catch(() => ({})); throw new Error(body.error || "Could not send your message."); }
+      if (!response.body) throw new Error("This app could not open the AI response stream.");
+      const reader = response.body.getReader(); const decoder = new TextDecoder(); let buffer = ""; let saved = false;
+      const consume = (block: string) => {
+        const line = block.split(/\r?\n/).find(item => item.startsWith("data:"));
+        if (!line) return;
+        const event = JSON.parse(line.slice(5).trim()) as { type: string; token?: string; error?: string; sent?: Message; received?: Message };
+        if (event.type === "token" && event.token) setData(current => ({ ...current, messages: current.messages.map(item => item.id === "stream-assistant" ? { ...item, content: item.content + event.token } : item) }));
+        if (event.type === "error") throw new Error(event.error || "The AI reply failed.");
+        if (event.type === "done" && event.sent && event.received) {
+          saved = true;
+          setData(current => ({ ...current, messages: [...current.messages.filter(item => item.id !== "stream-user" && item.id !== "stream-assistant"), event.sent!, event.received!] }));
+        }
+      };
+      while (true) {
+        const { value, done } = await reader.read(); buffer += decoder.decode(value, { stream: !done });
+        const blocks = buffer.split(/\r?\n\r?\n/); buffer = blocks.pop() || ""; blocks.forEach(consume);
+        if (done) break;
+      }
+      if (buffer.trim()) consume(buffer);
+      if (!saved) throw new Error("The AI stream ended before the reply was saved. Please try again.");
+    } catch (e) {
+      setData(current => ({ ...current, messages: current.messages.filter(item => item.id !== "stream-user" && item.id !== "stream-assistant") }));
+      setError(e instanceof Error ? e.message : "Could not send your message."); setChatText(prompt);
+    }
     finally { setBusy(false); }
   };
 

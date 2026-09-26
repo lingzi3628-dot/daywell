@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import Link from "next/link";
 import { LayoutDashboard, Target, Sparkles, PenLine, Bell, Settings, Search, Plus, ChevronRight, ArrowUpRight, ArrowRight, ArrowDownToLine, Check, Clock3, CalendarDays, MoreHorizontal, Trash2, Pencil, Send, WandSparkles, BookOpen, FileText, Clapperboard, Menu, X, LogOut, Lightbulb, CircleHelp, Zap, CheckCircle2, Loader2, ChevronDown, ShieldCheck, Link2, AlertCircle, RotateCcw } from "lucide-react";
 import DailyCheckin from "./daily-checkin";
 import FocusStudio from "./focus-studio";
@@ -84,8 +85,8 @@ export default function Home() {
     return () => { cancelled = true; };
   }, [load]);
   useEffect(() => { if (section === "AI companion") chatEnd.current?.scrollIntoView({ behavior: "smooth" }); }, [data.messages, section]);
-  useEffect(() => { const timer = setInterval(() => { if (document.visibilityState === "visible" && user) load(); }, 30000); return () => clearInterval(timer); }, [user, load]);
-  useEffect(() => { const due = data.reminders.filter(r => !r.done && new Date(r.remindAt).getTime() <= Date.now() && new Date(r.remindAt).getTime() > Date.now() - 3600000); if (due.length && "Notification" in window && Notification.permission === "granted") { const key = `notified-${due[0].id}`; if (!sessionStorage.getItem(key)) { new Notification("Daywell reminder", { body: due[0].title }); sessionStorage.setItem(key, "1"); } } }, [data.reminders]);
+  useEffect(() => { const sync = () => { if (document.visibilityState === "visible" && user) void load(); }; const timer = setInterval(sync, 12000); document.addEventListener("visibilitychange", sync); return () => { clearInterval(timer); document.removeEventListener("visibilitychange", sync); }; }, [user, load]);
+  useEffect(() => { const due = data.reminders.filter(r => !r.done && new Date(r.remindAt).getTime() <= Date.now() && new Date(r.remindAt).getTime() > Date.now() - 3600000); if (due.length && "Notification" in window && Notification.permission === "granted") { for (const reminder of due) { const key = `notified-${reminder.id}`; if (!sessionStorage.getItem(key)) { new Notification("Daywell reminder", { body: reminder.title }); sessionStorage.setItem(key, "1"); } } } }, [data.reminders]);
   useEffect(() => {
     if (!(claimOpen || authScreen && authMode === "register") || !authForm.email.trim()) return;
     const email = authForm.email.trim(); const controller = new AbortController();
@@ -144,13 +145,55 @@ export default function Home() {
   const update = async (resource: string, id: string, fields: Record<string, unknown>) => { const before = data; setData(prev => ({ ...prev, [resource]: (prev[resource as keyof Data] as {id:string}[]).map(x => x.id === id ? { ...x, ...fields } : x) })); try { await request("/api/data", { resource, id, data: fields }, "PATCH"); await load(); } catch (e) { setData(before); notify((e as Error).message); } };
   const open = (kind: typeof modal, item?: Record<string, unknown>) => { setModal(kind); setEditing(item?.id as string || null); setError(""); setTestStatus(null); setForm(item ? Object.fromEntries(Object.entries(item).map(([k,v]) => [k, v == null ? "" : String(v)])) : kind === "reminder" ? { remindAt: new Date(Date.now() + 3600000).toISOString().slice(0,16) } : kind === "connection" ? { provider: "OpenRouter", model: providerDefaults.OpenRouter } : kind === "project" ? { type: "Story", genre: "Contemporary" } : kind === "goal" ? { category: "Personal", color: "blue" } : {}); };
   const plan = async () => { if (!idea.trim()) return; setBusy(true); setError(""); try { const result = await request("/api/ai", { action: "plan", input: idea }); await load(); setIdea(""); setSection("My goals"); notify(result.powered ? "Your AI-powered plan is ready!" : "Your goal and daily steps are ready!"); } catch (e) { setError((e as Error).message); } finally { setBusy(false); } };
-  const chat = async (value?: string) => { const text = (value || chatInput).trim(); if (!text || busy) return; setChatInput(""); setBusy(true); setError(""); const temp: Message = { id: "temp", role: "user", content: text, createdAt: new Date().toISOString() }; setData(prev => ({ ...prev, messages: [...prev.messages, temp] })); try { const result = await request("/api/ai", { action: "chat", input: text }); setData(prev => ({ ...prev, messages: [...prev.messages.filter(m => m.id !== "temp"), result.sent, result.received] })); refreshAIStatus(); } catch (e) { setData(prev => ({ ...prev, messages: prev.messages.filter(m => m.id !== "temp") })); setChatInput(text); setError((e as Error).message); } finally { setBusy(false); } };
+  const chat = async (value?: string) => {
+    const text = (value || chatInput).trim();
+    if (!text || busy) return;
+    setChatInput(""); setBusy(true); setError("");
+    const temp: Message = { id: "temp", role: "user", content: text, createdAt: new Date().toISOString() };
+    const streaming: Message = { id: "streaming", role: "assistant", content: "", createdAt: new Date().toISOString() };
+    setData(prev => ({ ...prev, messages: [...prev.messages, temp, streaming] }));
+    try {
+      const response = await authFetch("/api/ai", { method: "POST", cache: "no-store", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "chat-stream", input: text }) });
+      if (!response.ok) {
+        const result = await response.json().catch(() => ({}));
+        if (response.status === 401) handleExpired();
+        throw new Error(result.error || "The AI reply could not be started.");
+      }
+      if (!response.body) throw new Error("Your browser could not open the AI response stream.");
+      const reader = response.body.getReader(); const decoder = new TextDecoder();
+      let buffer = ""; let saved = false;
+      const consume = (block: string) => {
+        const line = block.split(/\r?\n/).find(x => x.startsWith("data:"));
+        if (!line) return;
+        const event = JSON.parse(line.slice(5).trim()) as { type: string; token?: string; error?: string; sent?: Message; received?: Message };
+        if (event.type === "token" && event.token) setData(prev => ({ ...prev, messages: prev.messages.map(m => m.id === "streaming" ? { ...m, content: m.content + event.token } : m) }));
+        if (event.type === "error") throw new Error(event.error || "The AI reply failed.");
+        if (event.type === "done" && event.sent && event.received) {
+          saved = true;
+          setData(prev => ({ ...prev, messages: [...prev.messages.filter(m => m.id !== "temp" && m.id !== "streaming"), event.sent!, event.received!] }));
+          refreshAIStatus();
+        }
+      };
+      while (true) {
+        const { value: chunk, done } = await reader.read();
+        buffer += decoder.decode(chunk, { stream: !done });
+        const blocks = buffer.split(/\r?\n\r?\n/); buffer = blocks.pop() || "";
+        blocks.forEach(consume);
+        if (done) break;
+      }
+      if (buffer.trim()) consume(buffer);
+      if (!saved) throw new Error("The AI stream ended before the reply was saved. Please try again.");
+    } catch (e) {
+      setData(prev => ({ ...prev, messages: prev.messages.filter(m => m.id !== "temp" && m.id !== "streaming") }));
+      setChatInput(text); setError((e as Error).message);
+    } finally { setBusy(false); }
+  };
   const generate = async () => { const project = data.projects.find(p => p.id === selectedProject); const title = project?.title || form.title || "Untitled story"; const premise = project?.premise || form.premise || "A character faces an unexpected turning point"; setBusy(true); setError(""); try { const result = await request("/api/ai", { action: "write", input: premise, title, genre: project?.genre || form.genre || "Contemporary", type: project?.type || writingType, mode: writingMode }); if (project) { await request("/api/data", { resource: "projects", id: project.id, data: { content: project.content ? project.content + "\n\n" + result.content : result.content } }, "PATCH"); await load(); } else { const saved = await request("/api/data", { resource: "projects", data: { title, premise, genre: form.genre || "Contemporary", type: writingType, content: result.content } }); await load(); setSelectedProject(saved.item.id); } notify("Your writing is ready in the editor!"); } catch (e) { setError((e as Error).message); } finally { setBusy(false); } };
   const activeTasks = data.tasks.filter(t => !t.completed); const doneTasks = data.tasks.filter(t => t.completed); const progress = data.tasks.length ? Math.round(doneTasks.length / data.tasks.length * 100) : 0; const activeGoals = data.goals.filter(g => g.status === "active"); const upcoming = data.reminders.filter(r => !r.done).sort((a,b) => +new Date(a.remindAt) - +new Date(b.remindAt)); const currentProject = data.projects.find(p => p.id === selectedProject);
   const go = (name: string) => { setSection(name); setMobile(false); setError(""); };
   const sectionTitle = section === "Overview" ? "Your space to grow" : section === "AI companion" ? "AI companion" : section === "Writing studio" ? "Writing studio" : section;
   if (loading) return <div className="loading-screen"><div className="brand-mark"><Sparkles size={22}/></div><Loader2 className="spin" size={25}/><span>Making your space ready...</span></div>;
-  if (authScreen) return <div className="auth-page"><div className="auth-glow"/><div className="auth-card"><div className="brand auth-brand"><div className="brand-mark"><Sparkles size={19}/></div><span>daywell<span className="brand-dot">.</span></span></div><div className="auth-icon"><Sparkles size={24}/></div><h1>{authMode === "login" ? "Welcome back" : "Make room for what matters"}</h1><p>Your ideas, goals, and creative life — all in one place.</p><form onSubmit={e => { e.preventDefault(); auth(authMode); }}>{authMode === "register" && <><label>Your name<input required value={authForm.name} onChange={e => setAuthForm({...authForm, name:e.target.value})} placeholder="Alex Morgan"/></label><label>What describes you?<select value={authForm.role} onChange={e => setAuthForm({...authForm, role:e.target.value})}>{["Student","Business owner","Introvert","Researcher","Writer","Creator"].map(x => <option key={x}>{x}</option>)}</select></label></>}<label>Email address<input type="email" required value={authForm.email} onChange={e => setAuthForm({...authForm, email:e.target.value})} placeholder="you@example.com"/>{authMode === "register" && emailCheck && <small className={`email-feedback ${emailCheck === "Email is available." ? "valid" : ""}`}>{emailCheck}</small>}</label><label>Password<input type="password" minLength={8} required value={authForm.password} onChange={e => setAuthForm({...authForm, password:e.target.value})} placeholder="At least 8 characters"/></label>{error && <div className="error"><AlertCircle size={15}/>{error}</div>}<button className="btn btn-primary full" disabled={busy}>{busy ? <Loader2 className="spin" size={16}/> : null}{authMode === "login" ? "Sign in" : "Create account"}<ArrowRight size={16}/></button></form><div className="auth-divider">or explore first</div><button className="btn btn-outline full" onClick={() => auth("demo")} disabled={busy}>Explore demo workspace <ArrowUpRight size={16}/></button><p className="auth-switch">{authMode === "login" ? "New here?" : "Already have an account?"} <button onClick={() => { setAuthMode(authMode === "login" ? "register" : "login"); setError(""); }}>{authMode === "login" ? "Create an account" : "Sign in"}</button></p></div><div className="auth-caption">A calmer way to get things done. ✳</div></div>;
+  if (authScreen) return <div className="auth-page"><div className="auth-glow"/><div className="auth-card"><div className="brand auth-brand"><div className="brand-mark"><Sparkles size={19}/></div><span>daywell<span className="brand-dot">.</span></span></div><div className="auth-icon"><Sparkles size={24}/></div><h1>{authMode === "login" ? "Welcome back" : "Make room for what matters"}</h1><p>Your ideas, goals, and creative life — all in one place.</p><form onSubmit={e => { e.preventDefault(); auth(authMode); }}>{authMode === "register" && <><label>Your name<input required value={authForm.name} onChange={e => setAuthForm({...authForm, name:e.target.value})} placeholder="Alex Morgan"/></label><label>What describes you?<select value={authForm.role} onChange={e => setAuthForm({...authForm, role:e.target.value})}>{["Student","Business owner","Introvert","Researcher","Writer","Creator"].map(x => <option key={x}>{x}</option>)}</select></label></>}<label>Email address<input type="email" required value={authForm.email} onChange={e => setAuthForm({...authForm, email:e.target.value})} placeholder="you@example.com"/>{authMode === "register" && emailCheck && <small className={`email-feedback ${emailCheck === "Email is available." ? "valid" : ""}`}>{emailCheck}</small>}</label><label>Password<input type="password" minLength={8} required value={authForm.password} onChange={e => setAuthForm({...authForm, password:e.target.value})} placeholder="At least 8 characters"/></label>{error && <div className="error"><AlertCircle size={15}/>{error}</div>}<button className="btn btn-primary full" disabled={busy}>{busy ? <Loader2 className="spin" size={16}/> : null}{authMode === "login" ? "Sign in" : "Create account"}<ArrowRight size={16}/></button></form><div className="auth-divider">or explore first</div><button className="btn btn-outline full" onClick={() => auth("demo")} disabled={busy}>Explore demo workspace <ArrowUpRight size={16}/></button><p className="auth-switch">{authMode === "login" ? "New here?" : "Already have an account?"} <button onClick={() => { setAuthMode(authMode === "login" ? "register" : "login"); setError(""); }}>{authMode === "login" ? "Create an account" : "Sign in"}</button></p><div className="auth-legal"><Link href="/terms">Terms of Service</Link><Link href="/privacy">Privacy Policy</Link></div></div><div className="auth-caption">A calmer way to get things done. ✳</div></div>;
   return <div className="app-shell">
     {mobile && <div className="mobile-overlay" onClick={() => setMobile(false)}/>}
     <aside className={`sidebar ${mobile ? "sidebar-open" : ""}`}>

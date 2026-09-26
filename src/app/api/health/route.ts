@@ -4,7 +4,7 @@ import { sql } from "drizzle-orm";
 export const dynamic = "force-dynamic";
 
 export async function GET() {
-  if (!process.env.DATABASE_URL_POOLED && !process.env.DATABASE_URL) {
+  if (!process.env.DATABASE_URL_POOLED && !process.env.DATABASE_URL && !process.env.POSTGRES_URL && !process.env.POSTGRES_PRISMA_URL) {
     return Response.json({ ok: false, error: "DATABASE_URL_POOLED is not configured." }, { status: 503 });
   }
   try {

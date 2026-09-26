@@ -3,7 +3,7 @@ import { db } from "@/db";
 import { goals, tasks, messages, checkins } from "@/db/schema";
 import { eq, desc } from "drizzle-orm";
 import { getUser } from "@/lib/auth";
-import { askWithAccess, getAIStatus } from "@/lib/ai-access";
+import { askWithAccess, getAIStatus, streamWithAccess } from "@/lib/ai-access";
 
 export const maxDuration = 60;
 export async function GET() {
@@ -45,12 +45,41 @@ export async function POST(req: NextRequest) {
       const created = await db.insert(tasks).values(plan.tasks.map(title => ({ userId: user.id, goalId: goal.id, title, dueDate: new Date().toISOString().slice(0, 10) }))).returning();
       return NextResponse.json({ goal, tasks: created, powered });
     }
+    if (body.action === "chat-stream") {
+      const history = await db.select().from(messages).where(eq(messages.userId, user.id)).orderBy(messages.createdAt);
+      const ownGoals = await db.select().from(goals).where(eq(goals.userId, user.id));
+      const [latestCheckin] = await db.select().from(checkins).where(eq(checkins.userId, user.id)).orderBy(desc(checkins.day)).limit(1);
+      const checkinContext = latestCheckin ? ` Last check-in: feeling ${latestCheckin.mood.toLowerCase()} on ${latestCheckin.day}. Note: ${latestCheckin.note.slice(0, 500) || "none"}.` : "";
+      const system = `You are Daywell, a warm and capable AI companion for students, founders, researchers and creators. Answer the user's actual question first. Be accurate, thoughtful and specific; use relevant details from this conversation and goals. Keep routine replies concise, but give depth when asked. Avoid filler, repeated summaries and generic motivational language. Offer practical next steps when useful, and ask at most one focused follow-up question. Never claim to have changed data or set reminders unless the app confirms it. You are not a therapist, doctor, lawyer or financial adviser; respond with care and encourage qualified support for high-stakes decisions. Active goals: ${ownGoals.filter(g => g.status === "active").map(g => g.title).join(", ") || "none yet"}.${checkinContext}`;
+      const encoder = new TextEncoder();
+      const emit = (controller: ReadableStreamDefaultController<Uint8Array>, value: object) => controller.enqueue(encoder.encode(`data: ${JSON.stringify(value)}\n\n`));
+      const stream = new ReadableStream<Uint8Array>({
+        async start(controller) {
+          try {
+            let reply = await streamWithAccess(user.id, user.email, "chat", system, input, history, token => emit(controller, { type: "token", token }));
+            if (!reply) {
+              reply = fallbackChat(input, ownGoals.map(g => g.title));
+              for (const part of reply.match(/\S+\s*/g) || [reply]) {
+                emit(controller, { type: "token", token: part });
+                await new Promise(resolve => setTimeout(resolve, 18));
+              }
+            }
+            const [sent] = await db.insert(messages).values({ userId: user.id, role: "user", content: input }).returning();
+            const [received] = await db.insert(messages).values({ userId: user.id, role: "assistant", content: reply }).returning();
+            emit(controller, { type: "done", sent, received });
+          } catch (error) {
+            emit(controller, { type: "error", error: error instanceof Error ? error.message : "AI request failed. Try again." });
+          } finally { controller.close(); }
+        },
+      });
+      return new Response(stream, { headers: { "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache, no-transform", "Connection": "keep-alive", "X-Accel-Buffering": "no" } });
+    }
     if (body.action === "chat") {
       const history = await db.select().from(messages).where(eq(messages.userId, user.id)).orderBy(messages.createdAt);
       const ownGoals = await db.select().from(goals).where(eq(goals.userId, user.id));
       const [latestCheckin] = await db.select().from(checkins).where(eq(checkins.userId, user.id)).orderBy(desc(checkins.day)).limit(1);
       const checkinContext = latestCheckin ? ` Last check-in: feeling ${latestCheckin.mood.toLowerCase()} on ${latestCheckin.day}. Note: ${latestCheckin.note.slice(0,500) || "none"}.` : "";
-      const system = `You are Daywell, a warm, practical AI companion for students, founders, introverts, researchers and creators. Be supportive, concise, specific and conversational. Help turn ideas into actionable next steps. The user's active goals: ${ownGoals.filter(g => g.status === "active").map(g => g.title).join(", ") || "none yet"}.${checkinContext} Never claim to have set a reminder unless it was actually set.`;
+      const system = `You are Daywell, a warm and capable AI companion for students, founders, researchers and creators. Answer the user's actual question first. Be accurate, thoughtful and specific; use relevant details from this conversation and goals. Keep routine replies concise, but give depth when asked. Avoid filler, repeated summaries and generic motivational language. Offer practical next steps when useful, and ask at most one focused follow-up question. Never claim to have changed data or set reminders unless the app confirms it. You are not a therapist, doctor, lawyer or financial adviser; respond with care and encourage qualified support for high-stakes decisions. Active goals: ${ownGoals.filter(g => g.status === "active").map(g => g.title).join(", ") || "none yet"}.${checkinContext}`;
       const reply = await askWithAccess(user.id, user.email, "chat", system, input, history) || fallbackChat(input, ownGoals.map(g => g.title));
       const [sent] = await db.insert(messages).values({ userId: user.id, role: "user", content: input }).returning();
       const [received] = await db.insert(messages).values({ userId: user.id, role: "assistant", content: reply }).returning();

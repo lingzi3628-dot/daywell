@@ -16,6 +16,9 @@ export async function GET(req: NextRequest) {
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
+    if (!process.env.DATABASE_URL_POOLED && !process.env.DATABASE_URL && !process.env.POSTGRES_URL && !process.env.POSTGRES_PRISMA_URL) {
+      return NextResponse.json({ error: "Daywell account storage is still being connected. Please try again shortly." }, { status: 503 });
+    }
     if (body.action === "logout") { await signOut(); return NextResponse.json({ ok: true }); }
     if (body.action === "demo") { const user = await ensureDemo(); const sessionToken = await createSession(user.id); return NextResponse.json({ user: { id: user.id, name: user.name, email: user.email, role: user.role, isDemo: true }, ...(body.client === "native" ? { sessionToken } : {}) }); }
     const email = String(body.email || "").trim().toLowerCase(); const password = String(body.password || "");
