@@ -7,13 +7,15 @@ import { eq } from "drizzle-orm";
 export const hashPassword = (password: string) => { const salt = randomBytes(16).toString("hex"); return `${salt}:${scryptSync(password, salt, 64).toString("hex")}`; };
 export const verifyPassword = (password: string, stored: string) => { try { const [salt, hash] = stored.split(":"); return timingSafeEqual(Buffer.from(hash, "hex"), scryptSync(password, salt, 64)); } catch { return false; } };
 const sha = (value: string) => createHash("sha256").update(value).digest("hex");
-const encryptionKey = process.env.ENCRYPTION_KEY;
-if (process.env.NODE_ENV === "production" && (!encryptionKey || encryptionKey.length < 32)) {
-  throw new Error("ENCRYPTION_KEY must be set to a random value of at least 32 characters in production.");
+function encryptionSecret() {
+  const encryptionKey = process.env.ENCRYPTION_KEY;
+  if (process.env.NODE_ENV === "production" && (!encryptionKey || encryptionKey.length < 32)) {
+    throw new Error("ENCRYPTION_KEY must be set to a random value of at least 32 characters in production.");
+  }
+  return createHash("sha256").update(encryptionKey || "daywell-local-development-key").digest();
 }
-const secret = createHash("sha256").update(encryptionKey || "daywell-local-development-key").digest();
-export function encrypt(value: string) { const iv = randomBytes(12); const cipher = createCipheriv("aes-256-gcm", secret, iv); const data = Buffer.concat([cipher.update(value, "utf8"), cipher.final()]); return `${iv.toString("hex")}:${cipher.getAuthTag().toString("hex")}:${data.toString("hex")}`; }
-export function decrypt(value: string) { const [iv, tag, data] = value.split(":"); const decipher = createDecipheriv("aes-256-gcm", secret, Buffer.from(iv, "hex")); decipher.setAuthTag(Buffer.from(tag, "hex")); return decipher.update(Buffer.from(data, "hex"), undefined, "utf8") + decipher.final("utf8"); }
+export function encrypt(value: string) { const iv = randomBytes(12); const cipher = createCipheriv("aes-256-gcm", encryptionSecret(), iv); const data = Buffer.concat([cipher.update(value, "utf8"), cipher.final()]); return `${iv.toString("hex")}:${cipher.getAuthTag().toString("hex")}:${data.toString("hex")}`; }
+export function decrypt(value: string) { const [iv, tag, data] = value.split(":"); const decipher = createDecipheriv("aes-256-gcm", encryptionSecret(), Buffer.from(iv, "hex")); decipher.setAuthTag(Buffer.from(tag, "hex")); return decipher.update(Buffer.from(data, "hex"), undefined, "utf8") + decipher.final("utf8"); }
 export async function createSession(userId: string) {
   const token = randomBytes(32).toString("hex");
   await db.insert(sessions).values({ userId, tokenHash: sha(token), expiresAt: new Date(Date.now() + 30 * 86400000) });
