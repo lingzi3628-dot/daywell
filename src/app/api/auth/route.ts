@@ -4,14 +4,30 @@ import { users } from "@/db/schema";
 import { eq } from "drizzle-orm";
 import { createSession, ensureDemo, getUser, hashPassword, signOut, verifyPassword } from "@/lib/auth";
 
+// Both GET (email availability check + session probe) and POST (login/register/
+// claim/demo/logout) hit the database on every request. Mark the route dynamic
+// so Next.js never tries to statically optimize or cache it.
+export const dynamic = "force-dynamic";
+
 export async function GET(req: NextRequest) {
   const email = req.nextUrl.searchParams.get("checkEmail")?.trim().toLowerCase();
   if (email !== undefined) {
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 254) return NextResponse.json({ available: false, message: "Enter a valid email address." });
-    const found = await db.select({ id: users.id }).from(users).where(eq(users.email, email)).limit(1);
-    return NextResponse.json({ available: !found.length, message: found.length ? "Email already registered." : "Email is available." });
+    try {
+      const found = await db.select({ id: users.id }).from(users).where(eq(users.email, email)).limit(1);
+      return NextResponse.json({ available: !found.length, message: found.length ? "Email already registered." : "Email is available." });
+    } catch (error) {
+      console.error("[api/auth] GET checkEmail failed:", error);
+      return NextResponse.json({ available: false, message: "Could not check that email right now." }, { status: 500 });
+    }
   }
-  const user = await getUser(); return NextResponse.json({ user: user ? { id: user.id, name: user.name, email: user.email, role: user.role, isDemo: user.email.endsWith("@daywell.demo") } : null });
+  try {
+    const user = await getUser();
+    return NextResponse.json({ user: user ? { id: user.id, name: user.name, email: user.email, role: user.role, isDemo: user.email.endsWith("@daywell.demo") } : null });
+  } catch (error) {
+    console.error("[api/auth] GET session probe failed:", error);
+    return NextResponse.json({ error: "Could not load your session." }, { status: 500 });
+  }
 }
 export async function POST(req: NextRequest) {
   try {
@@ -49,6 +65,9 @@ export async function POST(req: NextRequest) {
     if (error && typeof error === "object" && "code" in error && error.code === "23505") {
       return NextResponse.json({ error: "An account with this email already exists." }, { status: 409 });
     }
-    return NextResponse.json({ error: "Could not complete your request." }, { status: 500 });
+    // Log the real error so it shows up in `vercel logs` / the Vercel dashboard.
+    // The user-facing message stays generic — never leak DB internals.
+    console.error("[api/auth] POST failed:", error);
+    return NextResponse.json({ error: "Could not complete your request. Please try again in a moment." }, { status: 500 });
   }
 }

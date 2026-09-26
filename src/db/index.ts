@@ -1,25 +1,27 @@
-import { drizzle } from "drizzle-orm/node-postgres";
-import { Pool } from "pg";
+import { neon } from "@neondatabase/serverless";
+import { drizzle } from "drizzle-orm/neon-http";
 
-// Neon recommends the pooled URL for serverless application traffic.
+// Neon's HTTP driver is the correct client for serverless runtimes (Vercel,
+// Cloudflare Workers, Deno Deploy, etc.). Each query is a single HTTPS request
+// to Neon — no TCP pool to manage, no idle connections to leak, no cold-start
+// TLS handshake penalty. The `pg.Pool` based driver does not work reliably
+// inside Vercel serverless functions and causes intermittent 500s on /api/auth.
+//
+// `DATABASE_URL_POOLED` is the recommended Neon pooled URL (pooler mode).
+// `DATABASE_URL` (direct) is used for migration tooling but also works here
+// as a fallback for local development.
 const databaseUrl = process.env.DATABASE_URL_POOLED || process.env.DATABASE_URL;
 
-const globalForDb = globalThis as typeof globalThis & {
-  __arenaNextJsPostgresqlPool?: Pool;
-};
-
-export const pool =
-  globalForDb.__arenaNextJsPostgresqlPool ??
-  new Pool({
-    ...(databaseUrl ? { connectionString: databaseUrl } : {}),
-    max: Number(process.env.DATABASE_POOL_MAX || 5),
-    idleTimeoutMillis: 10_000,
-    connectionTimeoutMillis: 10_000,
-    ssl: databaseUrl?.includes(".neon.tech") ? { rejectUnauthorized: true } : undefined,
-  });
-
-if (process.env.NODE_ENV !== "production") {
-  globalForDb.__arenaNextJsPostgresqlPool = pool;
+if (!databaseUrl) {
+  throw new Error(
+    "DATABASE_URL_POOLED (or DATABASE_URL) is not set. Add it in your Vercel project → Settings → Environment Variables, then redeploy. See .env.example for the expected format."
+  );
 }
 
-export const db = drizzle(pool);
+// `neon()` returns a tagged-template query function that talks to Neon over
+// HTTPS. Drizzle wraps it into the same query-builder API the rest of the
+// codebase already uses (`db.select().from(...).where(...)`, `db.insert(...)`,
+// `db.update(...)`, `db.delete(...)`, `db.execute(sql\`...\`)`).
+const sql = neon(databaseUrl);
+
+export const db = drizzle({ client: sql });
