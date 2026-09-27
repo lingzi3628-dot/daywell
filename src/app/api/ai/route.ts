@@ -1,9 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/db";
-import { goals, tasks, messages, checkins } from "@/db/schema";
-import { eq, desc } from "drizzle-orm";
+import { goals, tasks, messages, checkins, installedModules } from "@/db/schema";
+import { and, eq, desc } from "drizzle-orm";
 import { getUser } from "@/lib/auth";
 import { askWithAccess, getAIStatus, streamWithAccess } from "@/lib/ai-access";
+import { getModuleManifest } from "@/lib/modules/catalog";
 
 export const maxDuration = 60;
 export async function GET() {
@@ -37,6 +38,19 @@ export async function POST(req: NextRequest) {
   try {
     const body = await req.json(); const input = String(body.input || "").trim().slice(0, 5000);
     if (!input) return NextResponse.json({ error: "Please enter something first." }, { status: 400 });
+    if (body.action === "module-tool") {
+      const moduleId = String(body.moduleId || ""); const tool = String(body.tool || ""); const manifest = getModuleManifest(moduleId);
+      if (!manifest || !manifest.aiTools.length) return NextResponse.json({ error: "This app has no AI tools." }, { status: 400 });
+      const [moduleInstall] = await db.select().from(installedModules).where(and(eq(installedModules.userId, user.id), eq(installedModules.moduleId, moduleId))).limit(1);
+      if (!moduleInstall?.enabled) return NextResponse.json({ error: "Install this app first." }, { status: 403 });
+      if (!(moduleInstall.permissions as string[]).includes("ai")) return NextResponse.json({ error: "Grant this app AI permission in the Apps section first." }, { status: 403 });
+      const allowedTools: Record<string, string[]> = { journal: ["summarize"], notes: ["summarize", "extract"], money: ["generate"] };
+      if (!(allowedTools[moduleId] || []).includes(tool)) return NextResponse.json({ error: "This app cannot use that AI tool." }, { status: 400 });
+      const system = tool === "summarize" ? "Summarize the user's supplied journal or notes faithfully and briefly. Do not invent facts. Use 3-5 useful bullet points." : tool === "extract" ? "Extract concrete tasks and useful links from the user's supplied notes. Do not invent details. Return a concise, structured list." : "Categorize this expense description into one of Food, Transport, Home, Health, Learning, Shopping, Bills, or Other. Return only the single category.";
+      const response = await askWithAccess(user.id, user.email, "write", system, input);
+      const fallback = tool === "generate" ? (/coffee|lunch|food|shop/i.test(input) ? "Food" : /bus|fare|taxi|fuel/i.test(input) ? "Transport" : "Other") : tool === "extract" ? `Possible next step: review this note and choose one action.\n\n${input.slice(0, 600)}` : input.slice(0, 650) + (input.length > 650 ? "…" : "");
+      return NextResponse.json({ content: response || fallback, powered: !!response });
+    }
     if (body.action === "plan") {
       const system = "You are Daywell, an encouraging life planning assistant. Turn the user's idea into an achievable daily-life goal. Return ONLY valid JSON with keys title (short), description (one sentence), category (one of Personal, Wellness, Business, Creative, Learning), tasks (array of 4 specific achievable first steps). No markdown.";
       let plan = fallbackPlan(input); let powered = false;
@@ -48,9 +62,10 @@ export async function POST(req: NextRequest) {
     if (body.action === "chat-stream") {
       const history = await db.select().from(messages).where(eq(messages.userId, user.id)).orderBy(messages.createdAt);
       const ownGoals = await db.select().from(goals).where(eq(goals.userId, user.id));
+      const ownTasks = await db.select().from(tasks).where(and(eq(tasks.userId, user.id), eq(tasks.completed, false))).limit(12);
       const [latestCheckin] = await db.select().from(checkins).where(eq(checkins.userId, user.id)).orderBy(desc(checkins.day)).limit(1);
       const checkinContext = latestCheckin ? ` Last check-in: feeling ${latestCheckin.mood.toLowerCase()} on ${latestCheckin.day}. Note: ${latestCheckin.note.slice(0, 500) || "none"}.` : "";
-      const system = `You are Daywell, a warm and capable AI companion for students, founders, researchers and creators. Answer the user's actual question first. Be accurate, thoughtful and specific; use relevant details from this conversation and goals. Keep routine replies concise, but give depth when asked. Avoid filler, repeated summaries and generic motivational language. Offer practical next steps when useful, and ask at most one focused follow-up question. Never claim to have changed data or set reminders unless the app confirms it. You are not a therapist, doctor, lawyer or financial adviser; respond with care and encourage qualified support for high-stakes decisions. Active goals: ${ownGoals.filter(g => g.status === "active").map(g => g.title).join(", ") || "none yet"}.${checkinContext}`;
+      const system = `You are Daywell, ${user.name}'s personal AI companion. The user is a ${user.role}. Remember their name naturally without repeating it in every answer. Answer the actual question first; be accurate, warm, specific, and concise unless they ask for depth. Use their goals, open tasks, check-ins, and conversation history only when relevant. Avoid filler and generic motivation. Offer a doable next step when useful and ask at most one focused follow-up. Never claim to change data or set reminders unless the app confirms it. You are not a therapist, doctor, lawyer, or financial adviser; respond with care and encourage qualified support for high-stakes decisions. Active goals: ${ownGoals.filter(g => g.status === "active").map(g => g.title).join(", ") || "none yet"}. Open tasks: ${ownTasks.map(t => `${t.title}${t.dueDate ? ` (due ${t.dueDate})` : ""}`).join("; ") || "none"}.${checkinContext}`;
       const encoder = new TextEncoder();
       const emit = (controller: ReadableStreamDefaultController<Uint8Array>, value: object) => controller.enqueue(encoder.encode(`data: ${JSON.stringify(value)}\n\n`));
       const stream = new ReadableStream<Uint8Array>({
@@ -58,7 +73,7 @@ export async function POST(req: NextRequest) {
           try {
             let reply = await streamWithAccess(user.id, user.email, "chat", system, input, history, token => emit(controller, { type: "token", token }));
             if (!reply) {
-              reply = fallbackChat(input, ownGoals.map(g => g.title));
+              reply = fallbackChat(input, ownGoals.map(g => g.title)).replace(/^That’s worth exploring\./, `That’s worth exploring, ${user.name.split(" ")[0]}.`);
               for (const part of reply.match(/\S+\s*/g) || [reply]) {
                 emit(controller, { type: "token", token: part });
                 await new Promise(resolve => setTimeout(resolve, 18));
@@ -77,9 +92,10 @@ export async function POST(req: NextRequest) {
     if (body.action === "chat") {
       const history = await db.select().from(messages).where(eq(messages.userId, user.id)).orderBy(messages.createdAt);
       const ownGoals = await db.select().from(goals).where(eq(goals.userId, user.id));
+      const ownTasks = await db.select().from(tasks).where(and(eq(tasks.userId, user.id), eq(tasks.completed, false))).limit(12);
       const [latestCheckin] = await db.select().from(checkins).where(eq(checkins.userId, user.id)).orderBy(desc(checkins.day)).limit(1);
       const checkinContext = latestCheckin ? ` Last check-in: feeling ${latestCheckin.mood.toLowerCase()} on ${latestCheckin.day}. Note: ${latestCheckin.note.slice(0,500) || "none"}.` : "";
-      const system = `You are Daywell, a warm and capable AI companion for students, founders, researchers and creators. Answer the user's actual question first. Be accurate, thoughtful and specific; use relevant details from this conversation and goals. Keep routine replies concise, but give depth when asked. Avoid filler, repeated summaries and generic motivational language. Offer practical next steps when useful, and ask at most one focused follow-up question. Never claim to have changed data or set reminders unless the app confirms it. You are not a therapist, doctor, lawyer or financial adviser; respond with care and encourage qualified support for high-stakes decisions. Active goals: ${ownGoals.filter(g => g.status === "active").map(g => g.title).join(", ") || "none yet"}.${checkinContext}`;
+      const system = `You are Daywell, ${user.name}'s personal AI companion. The user is a ${user.role}. Remember their name naturally without repeating it in every answer. Answer the actual question first; be accurate, warm, specific, and concise unless they ask for depth. Use their goals, open tasks, check-ins, and conversation history only when relevant. Avoid filler and generic motivation. Offer a doable next step when useful and ask at most one focused follow-up. Never claim to change data or set reminders unless the app confirms it. You are not a therapist, doctor, lawyer, or financial adviser; respond with care and encourage qualified support for high-stakes decisions. Active goals: ${ownGoals.filter(g => g.status === "active").map(g => g.title).join(", ") || "none yet"}. Open tasks: ${ownTasks.map(t => `${t.title}${t.dueDate ? ` (due ${t.dueDate})` : ""}`).join("; ") || "none"}.${checkinContext}`;
       const reply = await askWithAccess(user.id, user.email, "chat", system, input, history) || fallbackChat(input, ownGoals.map(g => g.title));
       const [sent] = await db.insert(messages).values({ userId: user.id, role: "user", content: input }).returning();
       const [received] = await db.insert(messages).values({ userId: user.id, role: "assistant", content: reply }).returning();

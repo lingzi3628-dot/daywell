@@ -7,8 +7,34 @@
     "userInterfaceStyle": "light",
     "icon": "./assets/icon.png",
     "scheme": "daywell",
-    "ios": { "supportsTablet": true, "bundleIdentifier": "app.daywell.mobile" },
-    "android": { "package": "app.daywell.mobile", "adaptiveIcon": { "foregroundImage": "./assets/adaptive-icon.png", "backgroundColor": "#526c57" }, "edgeToEdgeEnabled": true },
-    "plugins": ["expo-secure-store"]
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "app.daywell.mobile"
+    },
+    "android": {
+      "package": "app.daywell.mobile",
+      "permissions": ["android.permission.POST_NOTIFICATIONS"],
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#526c57"
+      },
+      "edgeToEdgeEnabled": true
+    },
+    "plugins": [
+      "expo-secure-store",
+      [
+        "expo-notifications",
+        {
+          "defaultChannel": "reminders-default",
+          "sounds": ["./assets/daywell_chime.wav"]
+        }
+      ]
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "adedf312-31e4-455a-b689-e249d6eda528"
+      }
+    },
+    "owner": "supers"
   }
 }

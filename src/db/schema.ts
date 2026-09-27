@@ -1,4 +1,4 @@
-import { pgTable, uuid, text, timestamp, boolean, integer, uniqueIndex } from "drizzle-orm/pg-core";
+import { pgTable, uuid, text, timestamp, boolean, integer, uniqueIndex, primaryKey, jsonb } from "drizzle-orm/pg-core";
 
 export const users = pgTable("users", {
   id: uuid("id").primaryKey().defaultRandom(),
@@ -6,6 +6,8 @@ export const users = pgTable("users", {
   email: text("email").notNull().unique(),
   passwordHash: text("password_hash").notNull(),
   role: text("role").notNull().default("Student"),
+  termsAcceptedAt: timestamp("terms_accepted_at", { withTimezone: true }),
+  termsVersion: text("terms_version"),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
 });
 export const sessions = pgTable("sessions", {
@@ -98,3 +100,19 @@ export const connections = pgTable("connections", {
   isActive: boolean("is_active").notNull().default(true),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
 });
+export const installedModules = pgTable("installed_modules", {
+  userId: uuid("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  moduleId: text("module_id").notNull(),
+  version: text("version").notNull(),
+  permissions: jsonb("permissions").$type<string[]>().notNull().default([]),
+  enabled: boolean("enabled").notNull().default(true),
+  installedAt: timestamp("installed_at", { withTimezone: true }).defaultNow().notNull(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+}, table => [primaryKey({ columns: [table.userId, table.moduleId] })]);
+export const moduleData = pgTable("module_data", {
+  userId: uuid("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  moduleId: text("module_id").notNull(),
+  key: text("key").notNull(),
+  value: jsonb("value").$type<unknown>().notNull(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+}, table => [primaryKey({ columns: [table.userId, table.moduleId, table.key] })]);

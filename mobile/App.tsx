@@ -1,14 +1,26 @@
-import { useCallback, useEffect, useMemo, useState, type ComponentProps } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ComponentProps } from "react";
 import {
-  ActivityIndicator, Alert, AppState, KeyboardAvoidingView, Modal, Platform, Pressable,
+  ActivityIndicator, Alert, Animated, AppState, KeyboardAvoidingView, Linking, Modal, Platform, Pressable,
   RefreshControl, ScrollView, StatusBar, StyleSheet, Text, TextInput, View,
 } from "react-native";
 import * as SecureStore from "expo-secure-store";
+// Import only local notification modules. The expo-notifications barrel imports
+// its automatic remote push-token registrar, which throws in Android Expo Go.
+import * as NotificationPermissions from "expo-notifications/build/NotificationPermissions";
+import * as NotificationScheduler from "expo-notifications/build/scheduleNotificationAsync";
+import * as ScheduledNotifications from "expo-notifications/build/getAllScheduledNotificationsAsync";
+import * as ScheduledNotificationCancellation from "expo-notifications/build/cancelScheduledNotificationAsync";
+import * as NotificationChannels from "expo-notifications/build/setNotificationChannelAsync";
+import * as NotificationHandler from "expo-notifications/build/NotificationsHandler";
+import { SchedulableTriggerInputTypes } from "expo-notifications/build/Notifications.types";
 import { fetch as expoFetch } from "expo/fetch";
 import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
 
 const API_URL = (process.env.EXPO_PUBLIC_API_URL || "").replace(/\/$/, "");
 const TOKEN_KEY = "daywell_mobile_session";
+const AI_PROVIDERS = ["OpenRouter", "OpenAI", "Gemini", "GLM", "Hugging Face", "Custom"];
+const AI_DEFAULTS: Record<string, string> = { OpenRouter: "openai/gpt-4o-mini", OpenAI: "gpt-4o-mini", Gemini: "gemini-2.5-flash", GLM: "glm-4-flash", "Hugging Face": "Qwen/Qwen2.5-72B-Instruct", Custom: "" };
+NotificationHandler.setNotificationHandler({ handleNotification: async () => ({ shouldShowBanner: true, shouldShowList: true, shouldPlaySound: true, shouldSetBadge: false }) });
 type User = { id: string; name: string; email: string; role: string };
 type Goal = { id: string; title: string; description: string; category: string; status: string; targetDate: string | null };
 type Task = { id: string; title: string; goalId: string | null; completed: boolean; priority: string; dueDate: string | null };
@@ -18,18 +30,30 @@ type Project = { id: string; title: string; type: string; genre: string; premise
 type Checkin = { id: string; day: string; mood: string; note: string; reflection: string };
 type FocusSession = { id: string; label: string; durationSeconds: number; elapsedSeconds: number; status: "running" | "paused" | "finished" | "discarded"; lastResumedAt: string | null };
 type Connection = { id: string; provider: string; model: string; endpoint?: string | null; isActive: boolean; createdAt: string };
+type InstalledApp = { moduleId: string; version: string; permissions: string[]; enabled: boolean };
+type AppEntry = { id: string; title: string; body: string; category?: string; amount?: number; createdAt: string; checkedDays?: string[] };
 type Data = { goals: Goal[]; tasks: Task[]; reminders: Reminder[]; messages: Message[]; projects: Project[]; checkins: Checkin[]; focus: FocusSession[]; connections: Connection[] };
-type Tab = "Today" | "Goals" | "Focus" | "Companion" | "Writing" | "Check-in" | "Reminders" | "Account";
+type Tab = "Today" | "Goals" | "Focus" | "Companion" | "Apps" | "Writing" | "Check-in" | "Reminders" | "Account";
 const blank: Data = { goals: [], tasks: [], reminders: [], messages: [], projects: [], checkins: [], focus: [], connections: [] };
+const MOBILE_APPS = [
+  { id: "tasks", name: "Tasks", icon: "✓", description: "Plan, prioritize, and finish your next steps.", permissions: ["tasks.read", "tasks.write", "storage", "notifications"] },
+  { id: "habits", name: "Habit tracker", icon: "✿", description: "Build routines with daily check-ins and streaks.", permissions: ["storage", "notifications"] },
+  { id: "journal", name: "Journal", icon: "✎", description: "Write a private daily entry and reflect on your week.", permissions: ["storage", "ai"] },
+  { id: "notes", name: "Notes & Capture", icon: "▤", description: "Capture ideas, organize them, and find action items.", permissions: ["storage", "ai"] },
+  { id: "money", name: "Money", icon: "$", description: "Log spending and see a simple weekly total.", permissions: ["storage", "ai"] },
+];
 
 async function request(path: string, token: string | null, init: RequestInit = {}) {
   if (!API_URL) throw new Error("Set EXPO_PUBLIC_API_URL to your deployed Daywell server URL in mobile/.env.");
   const headers = new Headers(init.headers);
   headers.set("Content-Type", "application/json");
   if (token) headers.set("Authorization", `Bearer ${token}`);
-  const response = await fetch(`${API_URL}${path}`, { ...init, headers });
-  const body = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(body.error || "Could not reach Daywell. Check your connection and try again.");
+  let response: Response;
+  try { response = await fetch(`${API_URL}${path}`, { ...init, headers }); }
+  catch { throw new Error(`Could not connect to Daywell at ${API_URL}. Check your internet connection and the mobile app's server URL.`); }
+  const body = await response.json().catch(() => null);
+  if (!response.ok) throw new Error(body?.error || `Daywell returned an unexpected response (HTTP ${response.status}). Try again or check the server deployment.`);
+  if (!body || typeof body !== "object") throw new Error("Daywell returned an unreadable response. Please update the app or try again shortly.");
   return body;
 }
 
@@ -43,6 +67,8 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [authMode, setAuthMode] = useState<"login" | "register">("login");
+  const [authStarted, setAuthStarted] = useState(false);
+  const [termsAccepted, setTermsAccepted] = useState(false);
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -59,8 +85,31 @@ export default function App() {
   const [offlinePreview, setOfflinePreview] = useState(false);
   const [connectionOpen, setConnectionOpen] = useState(false);
   const [providerKey, setProviderKey] = useState("");
+  const [providerName, setProviderName] = useState("OpenRouter");
+  const [providerEndpoint, setProviderEndpoint] = useState("");
   const [providerModel, setProviderModel] = useState("openai/gpt-4o-mini");
+  const [reminderDelay, setReminderDelay] = useState(60);
   const [connectionFeedback, setConnectionFeedback] = useState("");
+  const [showWelcome, setShowWelcome] = useState(false);
+  const [reminderSound, setReminderSound] = useState<"default" | "soft-chime" | "silent">("default");
+  const [installedApps, setInstalledApps] = useState<InstalledApp[]>([]);
+  const [selectedAppId, setSelectedAppId] = useState<string | null>(null);
+  const [appRows, setAppRows] = useState<AppEntry[]>([]);
+  const [appTitle, setAppTitle] = useState("");
+  const [appBody, setAppBody] = useState("");
+  const [appAmount, setAppAmount] = useState("");
+  const [appAIResult, setAppAIResult] = useState("");
+  const [appBusy, setAppBusy] = useState(false);
+  const chatScroll = useRef<ScrollView>(null);
+
+  useEffect(() => { void SecureStore.getItemAsync("daywell_reminder_sound").then(value => { if (value === "default" || value === "soft-chime" || value === "silent") setReminderSound(value); }); }, []);
+
+  useEffect(() => {
+    if (!user) return;
+    let active = true;
+    void SecureStore.getItemAsync(`daywell_welcome_seen_${user.id}`).then(seen => { if (active && !seen) setShowWelcome(true); });
+    return () => { active = false; };
+  }, [user]);
 
   const refresh = useCallback(async (session = token) => {
     if (offlinePreview) return;
@@ -71,6 +120,7 @@ export default function App() {
       request("/api/checkins", session, { cache: "no-store" }),
     ]);
     setData({ goals: result.goals || [], tasks: result.tasks || [], reminders: result.reminders || [], messages: result.messages || [], projects: result.projects || [], checkins: checkinResult.items || [], focus: focusResult.items || [], connections: result.connections || [] });
+    try { const apps = await request("/api/modules", session, { cache: "no-store" }); setInstalledApps(apps.installed || []); } catch { /* Older deployments can still use the core workspace. */ }
   }, [token, offlinePreview]);
 
   useEffect(() => {
@@ -107,15 +157,92 @@ export default function App() {
   };
 
   const authenticate = async (action: "login" | "register" | "demo") => {
+    if (action === "register" && !termsAccepted) { setError("Please read and accept the Terms of Service and Privacy Policy to create an account."); return; }
     setBusy(true); setError("");
     try {
-      const result = await request("/api/auth", null, { method: "POST", body: JSON.stringify({ action, client: "native", name, email, password }) });
+      const result = await request("/api/auth", null, { method: "POST", body: JSON.stringify({ action, client: "native", name, email, password, ...(action === "register" ? { termsAccepted: true } : {}) }) });
       if (!result.user || !result.sessionToken) throw new Error("Sign-in did not complete. Please try again.");
       await SecureStore.setItemAsync(TOKEN_KEY, result.sessionToken);
       setToken(result.sessionToken); setUser(result.user); setPassword("");
+      setAuthStarted(false); setTermsAccepted(false);
       await refresh(result.sessionToken);
     } catch (e) { setError(e instanceof Error ? e.message : "Sign-in failed."); }
     finally { setBusy(false); }
+  };
+
+  const openNativeApp = async (moduleId: string) => {
+    setSelectedAppId(moduleId); setAppTitle(""); setAppBody(""); setAppAmount(""); setAppAIResult(""); setError("");
+    if (moduleId === "tasks") { setAppRows([]); return; }
+    if (offlinePreview) { setAppRows([]); return; }
+    try { const result = await request(`/api/modules/data?module=${encodeURIComponent(moduleId)}&key=entries`, token, { cache: "no-store" }); setAppRows(Array.isArray(result.value) ? result.value : []); }
+    catch (e) { setAppRows([]); setError(e instanceof Error ? e.message : "Could not load this app’s saved entries."); }
+  };
+
+  const installNativeApp = async (moduleId: string) => {
+    const app = MOBILE_APPS.find(item => item.id === moduleId); if (!app) return;
+    if (offlinePreview) { setInstalledApps(current => [...current.filter(item => item.moduleId !== moduleId), { moduleId, version: "1.0.0", permissions: app.permissions, enabled: true }]); await openNativeApp(moduleId); return; }
+    if (!token) return;
+    setAppBusy(true); setError("");
+    try { const result = await request("/api/modules", token, { method: "POST", body: JSON.stringify({ action: "install", moduleId, permissions: app.permissions }) }); setInstalledApps(current => [...current.filter(item => item.moduleId !== moduleId), result.item]); await openNativeApp(moduleId); }
+    catch (e) { setError(e instanceof Error ? e.message : "Could not install this app. Update Daywell’s database, then retry."); }
+    finally { setAppBusy(false); }
+  };
+
+  const uninstallNativeApp = async () => {
+    if (!selectedAppId) return;
+    if (offlinePreview) { setInstalledApps(current => current.filter(item => item.moduleId !== selectedAppId)); setSelectedAppId(null); setAppRows([]); return; }
+    setAppBusy(true);
+    try { await request("/api/modules", token, { method: "POST", body: JSON.stringify({ action: "uninstall", moduleId: selectedAppId, deleteData: false }) }); setInstalledApps(current => current.filter(item => item.moduleId !== selectedAppId)); setSelectedAppId(null); setAppRows([]); }
+    catch (e) { setError(e instanceof Error ? e.message : "Could not remove this app."); }
+    finally { setAppBusy(false); }
+  };
+
+  const saveNativeAppEntry = async () => {
+    if (!selectedAppId || !appTitle.trim() && !appBody.trim()) return;
+    setAppBusy(true); setError("");
+    try {
+      if (selectedAppId === "tasks") {
+        if (offlinePreview) setData(current => ({ ...current, tasks: [{ id: `preview-task-${Date.now()}`, title: appTitle.trim(), goalId: null, completed: false, priority: "medium", dueDate: null }, ...current.tasks] }));
+        else { const result = await request("/api/data", token, { method: "POST", body: JSON.stringify({ resource: "tasks", data: { title: appTitle.trim(), priority: "medium" } }) }); setData(current => ({ ...current, tasks: [result.item, ...current.tasks] })); }
+      } else {
+        const app = MOBILE_APPS.find(item => item.id === selectedAppId);
+        const entry: AppEntry = { id: `${selectedAppId}-${Date.now()}`, title: appTitle.trim() || appBody.trim().split("\n")[0].slice(0, 100), body: appBody.trim(), createdAt: new Date().toISOString(), ...(selectedAppId === "money" ? { amount: Number(appAmount) || 0 } : {}) };
+        const next = [entry, ...appRows];
+        if (!offlinePreview) await request(`/api/modules/data?module=${encodeURIComponent(selectedAppId)}&key=entries`, token, { method: "PUT", body: JSON.stringify({ value: next }) });
+        setAppRows(next);
+      }
+      setAppTitle(""); setAppBody(""); setAppAmount("");
+    } catch (e) { setError(e instanceof Error ? e.message : "Could not save this entry."); }
+    finally { setAppBusy(false); }
+  };
+
+  const runNativeAppAI = async (tool: "summarize" | "extract" | "generate") => {
+    if (!selectedAppId) return;
+    const source = selectedAppId === "money" ? appTitle : appRows.map(row => `${row.title}: ${row.body}`).join("\n");
+    if (!source.trim()) { setError("Add an entry first so the AI has something to work with."); return; }
+    setAppBusy(true); setError("");
+    try { const result = await request("/api/ai", token, { method: "POST", body: JSON.stringify({ action: "module-tool", moduleId: selectedAppId, tool, input: source }) }); setAppAIResult(result.content || "No suggestion was returned."); }
+    catch (e) { setError(e instanceof Error ? e.message : "This AI tool could not run."); }
+    finally { setAppBusy(false); }
+  };
+
+  const toggleHabitEntry = async (entry: AppEntry) => {
+    if (!selectedAppId) return;
+    const today = new Date().toISOString().slice(0, 10); const checkedDays = entry.checkedDays || [];
+    const next = appRows.map(row => row.id === entry.id ? { ...row, checkedDays: checkedDays.includes(today) ? checkedDays.filter(day => day !== today) : [...checkedDays, today] } : row);
+    setAppRows(next);
+    if (!offlinePreview) try { await request(`/api/modules/data?module=${encodeURIComponent(selectedAppId)}&key=entries`, token, { method: "PUT", body: JSON.stringify({ value: next }) }); } catch (e) { setError(e instanceof Error ? e.message : "Could not update this habit."); }
+  };
+
+  const testReminderSound = async () => {
+    const sound = reminderSound === "default" ? "default" : reminderSound === "soft-chime" ? "daywell_chime.wav" : false;
+    try {
+      const permission = await NotificationPermissions.getPermissionsAsync();
+      const granted = permission.granted || (await NotificationPermissions.requestPermissionsAsync()).granted;
+      if (!granted) { setError("Allow notifications in Android settings to test reminder sounds."); return; }
+      if (Platform.OS === "android") { const channelId = `reminders-${reminderSound}`; const channelSound = reminderSound === "default" ? "default" : reminderSound === "soft-chime" ? "daywell_chime.wav" : null; await NotificationChannels.setNotificationChannelAsync(channelId, { name: "Daywell reminders", importance: 5, sound: channelSound, vibrationPattern: [0, 300, 150, 300] }); }
+      await NotificationScheduler.scheduleNotificationAsync({ content: { title: "Daywell sound test", body: `Your ${reminderSound === "soft-chime" ? "soft chime" : reminderSound === "silent" ? "silent" : "default"} reminder setting is ready.`, sound }, trigger: { type: SchedulableTriggerInputTypes.DATE, date: new Date(Date.now() + 1800), channelId: `reminders-${reminderSound}` } });
+    } catch (e) { setError(e instanceof Error ? e.message : "Could not test this reminder sound."); }
   };
 
   const signOut = async () => {
@@ -168,8 +295,9 @@ export default function App() {
       setTitle(""); setModal(null); setBusy(false); return;
     }
     const resource = modal === "goal" ? "goals" : modal === "task" ? "tasks" : "reminders";
+    const remindAt = new Date(Date.now() + reminderDelay * 60 * 1000);
     const payload = modal === "reminder"
-      ? { title: cleanTitle, note: "", remindAt: new Date(Date.now() + 60 * 60 * 1000).toISOString() }
+      ? { title: cleanTitle, note: "", remindAt: remindAt.toISOString() }
       : { title: cleanTitle };
     try {
       await request("/api/data", token, { method: "POST", body: JSON.stringify({ resource, data: payload }) });
@@ -178,8 +306,8 @@ export default function App() {
     finally { setBusy(false); }
   };
 
-  const sendChat = async () => {
-    const prompt = chatText.trim();
+  const sendChat = async (quickPrompt?: string) => {
+    const prompt = (quickPrompt ?? chatText).trim();
     if (!prompt || busy) return;
     setChatText(""); setBusy(true); setError("");
     if (offlinePreview) {
@@ -195,7 +323,16 @@ export default function App() {
       const headers = new Headers({ "Content-Type": "application/json" });
       if (token) headers.set("Authorization", `Bearer ${token}`);
       const response = await expoFetch(`${API_URL}/api/ai`, { method: "POST", headers, body: JSON.stringify({ action: "chat-stream", input: prompt }) });
-      if (!response.ok) { const body = await response.json().catch(() => ({})); throw new Error(body.error || "Could not send your message."); }
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        if (String(body.error || "").toLowerCase().includes("invalid action")) {
+          const result = await request("/api/ai", token, { method: "POST", body: JSON.stringify({ action: "chat", input: prompt }) });
+          if (!result.sent || !result.received) throw new Error(result.error || "The chat server returned an incomplete reply.");
+          setData(current => ({ ...current, messages: [...current.messages.filter(item => item.id !== "stream-user" && item.id !== "stream-assistant"), result.sent, result.received] }));
+          return;
+        }
+        throw new Error(body.error || "Could not send your message.");
+      }
       if (!response.body) throw new Error("This app could not open the AI response stream.");
       const reader = response.body.getReader(); const decoder = new TextDecoder(); let buffer = ""; let saved = false;
       const consume = (block: string) => {
@@ -222,6 +359,8 @@ export default function App() {
     }
     finally { setBusy(false); }
   };
+
+  useEffect(() => { if (tab === "Companion") chatScroll.current?.scrollToEnd({ animated: true }); }, [data.messages, tab]);
 
   const createWriting = async () => {
     if (!writingTitle.trim() || !writingPremise.trim() || writingBusy) return;
@@ -280,8 +419,8 @@ export default function App() {
   };
 
   const setReminderDone = async (reminder: Reminder) => {
-    if (offlinePreview) { setData(current => ({ ...current, reminders: current.reminders.map(item => item.id === reminder.id ? { ...item, done: true } : item) })); return; }
-    try { await request("/api/data", token, { method: "PATCH", body: JSON.stringify({ resource: "reminders", id: reminder.id, data: { done: true } }) }); await refresh(); }
+    if (offlinePreview) { setData(current => ({ ...current, reminders: current.reminders.map(item => item.id === reminder.id ? { ...item, done: true } : item) })); await cancelReminder(reminder.id); return; }
+    try { await request("/api/data", token, { method: "PATCH", body: JSON.stringify({ resource: "reminders", id: reminder.id, data: { done: true } }) }); await cancelReminder(reminder.id); await refresh(); }
     catch (e) { setError(e instanceof Error ? e.message : "Could not update reminder."); }
   };
 
@@ -290,16 +429,50 @@ export default function App() {
     setBusy(true); setError(""); setConnectionFeedback("");
     try {
       if (offlinePreview) {
-        setData(current => ({ ...current, connections: [{ id: `preview-connection-${Date.now()}`, provider: "OpenRouter", model: providerModel.trim(), isActive: true, createdAt: new Date().toISOString() }, ...current.connections] }));
+        setData(current => ({ ...current, connections: [{ id: `preview-connection-${Date.now()}`, provider: providerName, model: providerModel.trim(), isActive: true, createdAt: new Date().toISOString() }, ...current.connections] }));
         setConnectionFeedback("Preview only: this key was not sent or saved.");
       } else {
-        await request("/api/data", token, { method: "POST", body: JSON.stringify({ resource: "connections", data: { provider: "OpenRouter", model: providerModel.trim(), apiKey: providerKey.trim() } }) });
-        await refresh(); setConnectionFeedback("OpenRouter is connected and the key is encrypted on the server.");
+        const result = await request("/api/data", token, { method: "POST", body: JSON.stringify({ resource: "connections", data: { provider: providerName, model: providerModel.trim(), apiKey: providerKey.trim(), ...(providerName === "Custom" ? { endpoint: providerEndpoint.trim() } : {}) } }) });
+        if (!result.item) throw new Error("The provider test finished but Daywell did not confirm that the connection was saved.");
+        setData(current => ({ ...current, connections: [{ ...result.item, isActive: true }, ...current.connections.filter(item => item.id !== result.item.id).map(item => ({ ...item, isActive: false }))] }));
+        setConnectionFeedback(`${providerName} was tested and saved. Its key is encrypted on the Daywell server.`);
       }
       setProviderKey(""); setConnectionOpen(false);
     } catch (e) { setConnectionFeedback(e instanceof Error ? e.message : "Could not connect OpenRouter."); }
     finally { setBusy(false); }
   };
+
+  const scheduleReminder = async (reminder: Reminder) => {
+    const at = new Date(reminder.remindAt);
+    if (at.getTime() <= Date.now()) return;
+    try {
+      const permission = await NotificationPermissions.getPermissionsAsync();
+      const granted = permission.granted || (await NotificationPermissions.requestPermissionsAsync()).granted;
+      if (!granted) { setError("Enable notifications in your phone settings to hear reminder alerts."); return; }
+      const channelId = `reminders-${reminderSound}`;
+      const sound = reminderSound === "default" ? "default" : reminderSound === "soft-chime" ? "daywell_chime.wav" : false;
+      const channelSound = reminderSound === "default" ? "default" : reminderSound === "soft-chime" ? "daywell_chime.wav" : null;
+      if (Platform.OS === "android") await NotificationChannels.setNotificationChannelAsync(channelId, { name: `Daywell reminders (${reminderSound})`, importance: 5, sound: channelSound, vibrationPattern: [0, 300, 150, 300] });
+      const existing = await ScheduledNotifications.getAllScheduledNotificationsAsync();
+      const same = existing.find(item => item.content.data?.reminderId === reminder.id && item.content.data?.soundPreference === reminderSound);
+      if (same) return;
+      await Promise.all(existing.filter(item => item.content.data?.reminderId === reminder.id).map(item => ScheduledNotificationCancellation.cancelScheduledNotificationAsync(item.identifier)));
+      await NotificationScheduler.scheduleNotificationAsync({ content: { title: "Daywell reminder", body: reminder.title, sound, data: { reminderId: reminder.id, soundPreference: reminderSound } }, trigger: { type: SchedulableTriggerInputTypes.DATE, date: at, channelId } });
+    } catch { setError("Could not schedule this phone reminder. Check notification permissions."); }
+  };
+
+  const cancelReminder = async (id: string) => {
+    const existing = await ScheduledNotifications.getAllScheduledNotificationsAsync();
+    await Promise.all(existing.filter(item => item.content.data?.reminderId === id).map(item => ScheduledNotificationCancellation.cancelScheduledNotificationAsync(item.identifier)));
+  };
+
+  useEffect(() => { if (Platform.OS !== "web") void ScheduledNotifications.getAllScheduledNotificationsAsync().then(existing => {
+    const activeIds = new Set(data.reminders.filter(item => !item.done && new Date(item.remindAt).getTime() > Date.now()).map(item => item.id));
+    for (const item of existing) { const id = item.content.data?.reminderId; if (typeof id === "string" && !activeIds.has(id)) void ScheduledNotificationCancellation.cancelScheduledNotificationAsync(item.identifier); }
+    for (const item of data.reminders) if (!item.done && new Date(item.remindAt).getTime() > Date.now()) void scheduleReminder(item);
+  }).catch(() => { /* Notification access can be unavailable in previews or before permission is granted. */ }); }, [data.reminders, reminderSound]);
+
+  useEffect(() => { void SecureStore.setItemAsync("daywell_reminder_sound", reminderSound); }, [reminderSound]);
 
   const removeConnection = async (connection: Connection) => {
     if (offlinePreview) { setData(current => ({ ...current, connections: current.connections.filter(item => item.id !== connection.id) })); return; }
@@ -312,14 +485,17 @@ export default function App() {
   const activeFocus = data.focus.find(session => session.status === "running" || session.status === "paused");
   const focusElapsed = activeFocus ? Math.min(activeFocus.durationSeconds, activeFocus.elapsedSeconds + (activeFocus.status === "running" && activeFocus.lastResumedAt ? Math.max(0, Math.floor((focusNow - new Date(activeFocus.lastResumedAt).getTime()) / 1000)) : 0)) : 0;
   const focusLeft = activeFocus ? Math.max(0, activeFocus.durationSeconds - focusElapsed) : 25 * 60;
+  const selectedNativeApp = MOBILE_APPS.find(app => app.id === selectedAppId);
+  const selectedNativeInstall = installedApps.find(app => app.moduleId === selectedAppId && app.enabled);
   useEffect(() => { const timer = setInterval(() => setFocusNow(Date.now()), 1000); return () => clearInterval(timer); }, []);
+  useEffect(() => { if (tab === "Companion") chatScroll.current?.scrollToEnd({ animated: true }); }, [data.messages, tab]);
   useEffect(() => { if (tab === "Account" && token) void request("/api/ai", token, { cache: "no-store" }).then(status => setAiInfo(status.mode === "own" ? `Using your ${status.provider} · ${status.model}` : status.mode === "included" ? `Staff-managed OpenRouter is active · ${status.remaining} included requests left today` : "Staff shared AI is not configured yet. You can connect your own OpenRouter key below.")).catch(() => setAiInfo("AI status is unavailable right now.")); }, [tab, token]);
 
   if (booting) return <SafeAreaProvider><SafeAreaView style={styles.center}><ActivityIndicator size="large" color="#54735a"/><Text style={styles.muted}>Opening your space…</Text></SafeAreaView></SafeAreaProvider>;
 
   return <SafeAreaProvider><SafeAreaView style={styles.safe}>
     <StatusBar barStyle="dark-content" backgroundColor="#fbf8f3"/>
-    {!user ? <KeyboardAvoidingView style={styles.flex} behavior={Platform.OS === "ios" ? "padding" : undefined}>
+    {!user ? (authStarted ? <KeyboardAvoidingView style={styles.flex} behavior={Platform.OS === "ios" ? "padding" : undefined}>
       <ScrollView contentContainerStyle={styles.authWrap} keyboardShouldPersistTaps="handled">
         <View style={styles.logoMark}><Text style={styles.logoStar}>✦</Text></View>
         <Text style={styles.brand}>daywell<Text style={styles.brandDot}>.</Text></Text>
@@ -329,18 +505,19 @@ export default function App() {
           {authMode === "register" && <Field label="Your name" value={name} onChangeText={setName} placeholder="Alex Morgan"/>}
           <Field label="Email address" value={email} onChangeText={setEmail} placeholder="you@example.com" keyboardType="email-address" autoCapitalize="none"/>
           <Field label="Password" value={password} onChangeText={setPassword} placeholder="At least 8 characters" secureTextEntry/>
+          {authMode === "register" && <Pressable style={styles.consentRow} onPress={() => setTermsAccepted(value => !value)}><View style={[styles.consentCheck, termsAccepted && styles.consentCheckOn]}>{termsAccepted && <Text style={styles.consentTick}>✓</Text>}</View><Text style={styles.consentCopy}>I have read and accept the <Text style={styles.legalLink} onPress={e => { e.stopPropagation(); void Linking.openURL(`${API_URL || "https://daywell-tan.vercel.app"}/terms`); }}>Terms of Service</Text> and <Text style={styles.legalLink} onPress={e => { e.stopPropagation(); void Linking.openURL(`${API_URL || "https://daywell-tan.vercel.app"}/privacy`); }}>Privacy Policy</Text>.</Text></Pressable>}
           {!!error && <Text style={styles.error}>{error}</Text>}
-          <ActionButton label={busy ? "Please wait…" : authMode === "login" ? "Sign in" : "Create account"} onPress={() => void authenticate(authMode)} disabled={busy}/>
-          <Pressable onPress={() => { setAuthMode(authMode === "login" ? "register" : "login"); setError(""); }}><Text style={styles.switchText}>{authMode === "login" ? "New to Daywell? Create an account" : "Already have an account? Sign in"}</Text></Pressable>
+          <ActionButton label={busy ? "Please wait…" : authMode === "login" ? "Sign in" : "Create account"} onPress={() => void authenticate(authMode)} disabled={busy || authMode === "register" && !termsAccepted}/>
+          <Pressable onPress={() => { setAuthMode(authMode === "login" ? "register" : "login"); setTermsAccepted(false); setError(""); }}><Text style={styles.switchText}>{authMode === "login" ? "New to Daywell? Create an account" : "Already have an account? Sign in"}</Text></Pressable><Pressable onPress={() => setAuthStarted(false)}><Text style={styles.switchText}>← Back to Daywell</Text></Pressable>
           <Pressable onPress={() => void authenticate("demo")} disabled={busy}><Text style={styles.demoText}>Explore a demo workspace</Text></Pressable>
           {!API_URL && <><View style={styles.previewDivider}/><ActionButton label="Open offline preview" onPress={enterOfflinePreview}/><Text style={styles.previewNote}>Temporary sample data only. Connect the Neon-backed server to sign in and sync.</Text></>}
         </View>
       </ScrollView>
-    </KeyboardAvoidingView> : <>
-      <View style={styles.topBar}><View><Text style={styles.eyebrow}>YOUR PERSONAL SPACE</Text><Text style={styles.screenTitle}>{tab === "Today" ? `Hello, ${user.name.split(" ")[0]}` : tab}</Text></View><Pressable style={styles.avatar} onPress={() => Alert.alert("Your account", `${user.email}\n${user.role}`, [{ text: "Sign out", style: "destructive", onPress: () => void signOut() }, { text: "Close" }])}><Text style={styles.avatarText}>{user.name.split(" ").map(part => part[0]).slice(0,2).join("").toUpperCase()}</Text></Pressable></View>
+    </KeyboardAvoidingView> : <ScrollView contentContainerStyle={styles.landingWrap}><View style={styles.logoMark}><Text style={styles.logoStar}>✦</Text></View><Text style={styles.brand}>daywell<Text style={styles.brandDot}>.</Text></Text><Text style={styles.authTitle}>Your day, your goals,{"\n"}your way forward.</Text><Text style={styles.authSubtitle}>Keep goals, tasks, reminders, writing, and your AI companion in one calm space.</Text><View style={styles.landingCard}><Text style={styles.landingCardTitle}>A calmer way to move through the day</Text><Text style={styles.landingBullet}>✓  Goals and small daily steps</Text><Text style={styles.landingBullet}>✦  A personal AI companion</Text><Text style={styles.landingBullet}>♧  Reminders with a sound you choose</Text></View><ActionButton label="Create your account" onPress={() => { setAuthMode("register"); setTermsAccepted(false); setError(""); setAuthStarted(true); }}/><Pressable onPress={() => { setAuthMode("login"); setError(""); setAuthStarted(true); }}><Text style={styles.switchText}>Already have an account? Sign in</Text></Pressable><View style={styles.nativeLegal}><Text style={styles.muted}>By continuing, you can review the</Text><Text style={styles.legalLink} onPress={() => void Linking.openURL(`${API_URL || "https://daywell-tan.vercel.app"}/terms`)}>Terms of Service</Text><Text style={styles.muted}>and</Text><Text style={styles.legalLink} onPress={() => void Linking.openURL(`${API_URL || "https://daywell-tan.vercel.app"}/privacy`)}>Privacy Policy</Text></View><Pressable onPress={() => void authenticate("demo")}><Text style={styles.demoText}>Explore a demo workspace</Text></Pressable></ScrollView>) : <>
+      <View style={styles.topBar}><View><Text style={styles.eyebrow}>YOUR PERSONAL SPACE</Text><Text style={styles.screenTitle}>{tab === "Today" ? `Hello, ${user.name.split(" ")[0]}` : tab === "Companion" ? "Daywell AI" : tab}</Text></View><Pressable style={styles.avatar} onPress={() => Alert.alert("Your account", `${user.email}\n${user.role}`, [{ text: "Sign out", style: "destructive", onPress: () => void signOut() }, { text: "Close" }])}><Text style={styles.avatarText}>{user.name.split(" ").map(part => part[0]).slice(0,2).join("").toUpperCase()}</Text></Pressable></View>
       {offlinePreview && <Text style={styles.offlineBanner}>OFFLINE PREVIEW · CHANGES ARE LOCAL ONLY</Text>}
       {!!error && <Pressable onPress={() => setError("")}><Text style={styles.errorBanner}>{error}  ×</Text></Pressable>}
-      <ScrollView style={styles.flex} contentContainerStyle={styles.content} refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => void load()} tintColor="#54735a"/>} keyboardShouldPersistTaps="handled">
+      <ScrollView ref={chatScroll} style={[styles.flex, tab === "Companion" && styles.chatScroll]} contentContainerStyle={[styles.content, tab === "Companion" && styles.chatContent]} onContentSizeChange={() => { if (tab === "Companion") chatScroll.current?.scrollToEnd({ animated: true }); }} refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => void load()} tintColor="#54735a"/>} keyboardShouldPersistTaps="handled">
         {tab === "Today" && <>
           <View style={styles.hero}><Text style={styles.heroKicker}>A LITTLE PROGRESS ADDS UP</Text><Text style={styles.heroTitle}>Make today{`\n`}your own.</Text><Text style={styles.heroCopy}>One small step is enough to get moving.</Text><Pressable onPress={() => setTab("Goals")} style={styles.heroButton}><Text style={styles.heroButtonText}>See my goals  →</Text></Pressable></View>
           <View style={styles.statsRow}><Stat value={String(data.goals.filter(g => g.status === "active").length)} label="Active goals"/><Stat value={String(openTasks.length)} label="Open tasks"/><Stat value={String(dueReminders.length)} label="Reminders"/></View>
@@ -363,10 +540,36 @@ export default function App() {
           {data.focus.filter(session => session.status === "finished").slice(0,8).map(session => <View style={styles.goalCard} key={session.id}><View style={styles.flex}><Text style={styles.cardTitle}>{session.label}</Text><Text style={styles.muted}>{Math.round(session.elapsedSeconds / 60)} minutes · completed</Text></View></View>)}
           {!data.focus.length && <EmptyCard title="Build a little momentum" detail="Start your first session when you’re ready."/>}
         </>}
+        {tab === "Apps" && <>
+          {!selectedNativeApp ? <>
+            <View style={styles.writeIntro}><Text style={styles.heroKicker}>DAYWELL MINI STORE</Text><Text style={styles.cardTitle}>Small tools for everyday life</Text><Text style={styles.muted}>Install only the apps you want. Each app asks for its own access before installation.</Text></View>
+            {MOBILE_APPS.map(app => { const installed = installedApps.some(item => item.moduleId === app.id && item.enabled); return <View key={app.id} style={styles.mobileAppCard}><View style={styles.mobileAppIcon}><Text style={styles.mobileAppGlyph}>{app.icon}</Text></View><View style={styles.mobileAppCopy}><Text style={styles.cardTitle}>{app.name}</Text><Text style={styles.muted}>{app.description}</Text><Text style={styles.appPermissions}>Access: {app.permissions.map(permission => permission === "ai" ? "AI" : permission === "storage" ? "app storage" : permission.replace(".", " ")).join(" · ")}</Text></View><Pressable style={styles.mobileAppButton} onPress={() => installed ? void openNativeApp(app.id) : Alert.alert(`Install ${app.name}?`, `This app will have access to: ${app.permissions.map(permission => permission === "ai" ? "AI tools" : permission === "storage" ? "its own saved data" : permission.replace(".", " ")).join(", ")}. You can remove it from your installed apps later.`, [{ text: "Cancel", style: "cancel" }, { text: "Install", onPress: () => void installNativeApp(app.id) }])}><Text style={styles.mobileAppButtonText}>{installed ? "Open" : "Install"}</Text></Pressable></View>; })}
+          </> : <>
+            <SectionTitle title={selectedNativeApp.name} action="← All apps" onAction={() => { setSelectedAppId(null); setAppAIResult(""); setError(""); }}/>
+            <Text style={styles.muted}>{selectedNativeApp.description}</Text>
+            {!selectedNativeInstall && !offlinePreview && <EmptyCard title="This app is not installed" detail="Go back to the store and install it first."/>}
+            {selectedNativeApp.id === "tasks" ? <>
+              <View style={styles.moduleInputCard}><TextInput style={styles.moduleTitleInput} value={appTitle} onChangeText={setAppTitle} placeholder="Add a small next step"/><ActionButton label={appBusy ? "Adding…" : "Add task"} onPress={() => void saveNativeAppEntry()} disabled={appBusy || !appTitle.trim()}/></View>
+              {openTasks.map(task => <TaskRow key={task.id} task={task} onPress={() => void toggleTask(task)}/>)}
+              {!openTasks.length && <EmptyCard title="Nothing waiting" detail="Add your first task above."/>}
+            </> : <>
+              {selectedNativeApp.id === "money" && <TextInput style={styles.moduleTitleInput} value={appAmount} onChangeText={setAppAmount} keyboardType="decimal-pad" placeholder="Amount in KES"/>}
+              {selectedNativeApp.id !== "habits" && <TextInput style={styles.moduleTitleInput} value={appTitle} onChangeText={setAppTitle} placeholder={selectedNativeApp.id === "money" ? "What did you spend on?" : "Title (optional)"}/>}
+              {selectedNativeApp.id !== "habits" && <TextInput style={styles.moduleBodyInput} value={appBody} onChangeText={setAppBody} placeholder={selectedNativeApp.id === "journal" ? "Write a few lines about today…" : selectedNativeApp.id === "notes" ? "Capture a thought or useful detail…" : "Optional note"} multiline/>}
+              <ActionButton label={appBusy ? "Saving…" : selectedNativeApp.id === "habits" ? "Add habit" : selectedNativeApp.id === "journal" ? "Save today’s entry" : selectedNativeApp.id === "money" ? "Log expense" : "Capture note"} onPress={() => void saveNativeAppEntry()} disabled={appBusy || selectedNativeApp.id === "habits" ? appBusy || !appTitle.trim() : appBusy || selectedNativeApp.id === "money" && (!appTitle.trim() || Number(appAmount) <= 0) || selectedNativeApp.id !== "money" && !appBody.trim()}/>
+              {(selectedNativeApp.id === "journal" || selectedNativeApp.id === "notes" || selectedNativeApp.id === "money") && <Pressable style={styles.appAIButton} onPress={() => void runNativeAppAI(selectedNativeApp.id === "notes" ? "extract" : selectedNativeApp.id === "money" ? "generate" : "summarize")} disabled={appBusy}><Text style={styles.appAIText}>{appBusy ? "Thinking…" : selectedNativeApp.id === "money" ? "Suggest a category with AI" : selectedNativeApp.id === "notes" ? "Find action items with AI" : "Summarize entries with AI"}</Text></Pressable>}
+              {!!appAIResult && <View style={styles.projectCard}><Text style={styles.projectKicker}>DAYWELL AI</Text><Text style={styles.projectContent}>{appAIResult}</Text></View>}
+              {selectedNativeApp.id === "money" && <View style={styles.moneyTotal}><Text style={styles.muted}>Logged total</Text><Text style={styles.cardTitle}>KES {appRows.reduce((sum, row) => sum + (row.amount || 0), 0).toLocaleString("en-KE")}</Text></View>}
+              <Text style={styles.sectionTitle}> {selectedNativeApp.id === "habits" ? "Your habits" : "Recent entries"}</Text>
+              {appRows.map(entry => <View style={styles.mobileEntry} key={entry.id}>{selectedNativeApp.id === "habits" ? <Pressable style={[styles.moduleCheck, entry.checkedDays?.includes(new Date().toISOString().slice(0,10)) && styles.moduleCheckOn]} onPress={() => void toggleHabitEntry(entry)}><Text style={styles.moduleCheckText}>{entry.checkedDays?.includes(new Date().toISOString().slice(0,10)) ? "✓" : "○"}</Text></Pressable> : null}<View style={styles.flex}><Text style={styles.cardTitle}>{entry.title}</Text>{entry.amount ? <Text style={styles.muted}>KES {entry.amount.toLocaleString("en-KE")} · {new Date(entry.createdAt).toLocaleDateString()}</Text> : <Text style={styles.muted}>{selectedNativeApp.id === "habits" ? `${entry.checkedDays?.length || 0} days checked` : entry.body || new Date(entry.createdAt).toLocaleDateString()}</Text>}</View></View>)}
+              {!appRows.length && selectedNativeApp.id !== "money" && <EmptyCard title={selectedNativeApp.id === "habits" ? "Start with one habit" : "Your entries will appear here"} detail="Your saved entries sync with your Daywell account."/>}
+              {selectedNativeInstall && <Pressable style={styles.removeAppButton} onPress={() => Alert.alert(`Remove ${selectedNativeApp.name}?`, "The app will be uninstalled from this account. Its saved entries will be kept.", [{ text: "Cancel", style: "cancel" }, { text: "Remove app", style: "destructive", onPress: () => void uninstallNativeApp() }])}><Text style={styles.removeAppText}>{appBusy ? "Removing…" : "Uninstall app · keep saved data"}</Text></Pressable>}
+            </>}
+          </>}
+        </>}
         {tab === "Companion" && <>
-          <View style={styles.chatIntro}><Text style={styles.chatSymbol}>✦</Text><Text style={styles.cardTitle}>A thought partner for your day</Text><Text style={styles.muted}>Ask for a plan, a fresh perspective, or a small next step.</Text></View>
-          {data.messages.map(message => <View key={message.id} style={[styles.message, message.role === "user" ? styles.userMessage : styles.assistantMessage]}><Text style={message.role === "user" ? styles.userMessageText : styles.messageText}>{message.content}</Text></View>)}
-          <View style={styles.chatComposer}><TextInput style={styles.chatInput} value={chatText} onChangeText={setChatText} placeholder="What’s on your mind?" multiline/><Pressable onPress={() => void sendChat()} style={styles.sendButton} disabled={busy}><Text style={styles.sendText}>↑</Text></Pressable></View>
+          {!data.messages.length && <View style={styles.chatWelcome}><View style={styles.chatWelcomeMark}><Text style={styles.chatSymbol}>✦</Text></View><Text style={styles.chatWelcomeTitle}>What’s on your mind?</Text><Text style={styles.muted}>Ask for help with a plan, a problem, or an idea. Daywell uses your goals to keep the conversation personal.</Text><View style={styles.promptGrid}>{["Help me plan today", "I feel stuck", "Help me focus", "Give me a writing idea"].map(prompt => <Pressable key={prompt} style={styles.promptChip} onPress={() => void sendChat(prompt)} disabled={busy}><Text style={styles.promptChipText}>{prompt}</Text><Text style={styles.promptArrow}>↗</Text></Pressable>)}</View></View>}
+          {data.messages.map(message => <View key={message.id} style={[styles.message, message.role === "user" ? styles.userMessage : styles.assistantMessage]}>{message.id === "stream-assistant" && !message.content ? <TypingDots/> : <Text style={message.role === "user" ? styles.userMessageText : styles.messageText}>{message.content}</Text>}</View>)}
         </>}
         {tab === "Writing" && <>
           <View style={styles.writeIntro}><Text style={styles.heroKicker}>THE CREATIVE DESK</Text><Text style={styles.cardTitle}>Give your idea a first page.</Text><Text style={styles.muted}>Describe a story idea and Daywell will create an opening draft and keep it in your studio.</Text></View>
@@ -392,17 +595,20 @@ export default function App() {
         {tab === "Account" && <>
           <View style={styles.accountCard}><View style={styles.avatar}><Text style={styles.avatarText}>{user.name.split(" ").map(part => part[0]).slice(0,2).join("").toUpperCase()}</Text></View><Text style={styles.cardTitle}>{user.name}</Text><Text style={styles.muted}>{user.email}</Text><Text style={styles.accountRole}>{user.role}</Text></View>
           <View style={styles.projectCard}><Text style={styles.projectKicker}>STAFF AI SERVICE</Text><Text style={styles.cardTitle}>Shared OpenRouter</Text><Text style={styles.muted}>{offlinePreview ? "Offline preview only; staff AI status is not connected." : aiInfo || "Checking your AI connection…"}</Text><Text style={styles.projectContent}>Staff enable shared access by setting OPENROUTER_API_KEY and OPENROUTER_MODEL on the server. Keep this secret out of the app build.</Text></View>
-          <SectionTitle title="Your AI connections" action="＋ Add OpenRouter" onAction={() => { setConnectionFeedback(""); setConnectionOpen(true); }}/>
+          <SectionTitle title="Reminder sound" action="Test sound" onAction={() => void testReminderSound()}/><Text style={styles.muted}>Choose the sound for reminders on this phone. Android may remember an existing channel’s original sound; if it does, change the Daywell reminders channel in Android notification settings.</Text><View style={styles.providerChoices}>{(["default", "soft-chime", "silent"] as const).map(sound => <Pressable key={sound} onPress={() => setReminderSound(sound)} style={[styles.providerChip, reminderSound === sound && styles.providerChipOn]}><Text style={[styles.providerChipText, reminderSound === sound && styles.providerChipTextOn]}>{sound === "default" ? "Phone default" : sound === "soft-chime" ? "Soft chime" : "Silent"}</Text></Pressable>)}</View>
+          <SectionTitle title="Your AI connections" action="＋ Add AI provider" onAction={() => { setConnectionFeedback(""); setConnectionOpen(true); }}/>
           {data.connections.map(connection => <View style={styles.connectionCard} key={connection.id}><View style={styles.flex}><Text style={styles.cardTitle}>{connection.provider}</Text><Text style={styles.muted}>{connection.model} · {connection.isActive ? "Active" : "Inactive"}</Text></View><Pressable onPress={() => Alert.alert("Remove connection?", "This only removes the encrypted key from your Daywell account.", [{ text: "Cancel" }, { text: "Remove", style: "destructive", onPress: () => void removeConnection(connection) }])}><Text style={styles.removeConnection}>Remove</Text></Pressable></View>)}
           {!data.connections.length && <EmptyCard title="No personal AI connection" detail="Use the staff shared OpenRouter service, or add your own private key."/>}
           {!!connectionFeedback && <Text style={styles.connectionFeedback}>{connectionFeedback}</Text>}
           <Pressable style={styles.signOutButton} onPress={() => void signOut()}><Text style={styles.signOutText}>Sign out</Text></Pressable>
         </>}
       </ScrollView>
-      <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.tabBar} contentContainerStyle={styles.tabBarInner}>{(["Today", "Goals", "Focus", "Companion", "Writing", "Check-in", "Reminders", "Account"] as Tab[]).map(item => <Pressable key={item} onPress={() => { setTab(item); setError(""); }} style={styles.tabItem}><Text style={[styles.tabGlyph, tab === item && styles.tabGlyphOn]}>{item === "Today" ? "⌂" : item === "Goals" ? "◎" : item === "Focus" ? "◷" : item === "Companion" ? "✦" : item === "Writing" ? "✎" : item === "Check-in" ? "♡" : item === "Reminders" ? "♧" : "◉"}</Text><Text style={[styles.tabLabel, tab === item && styles.tabLabelOn]}>{item}</Text></Pressable>)}</ScrollView>
+      {tab === "Companion" && <View style={styles.chatComposer}><TextInput style={styles.chatInput} value={chatText} onChangeText={setChatText} placeholder="Message Daywell" multiline returnKeyType="default"/><Pressable onPress={() => void sendChat()} style={[styles.sendButton, (!chatText.trim() || busy) && styles.sendDisabled]} disabled={busy || !chatText.trim()}><Text style={styles.sendText}>↑</Text></Pressable></View>}
+      <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.tabBar} contentContainerStyle={styles.tabBarInner}>{(["Today", "Goals", "Focus", "Companion", "Apps", "Writing", "Check-in", "Reminders", "Account"] as Tab[]).map(item => <Pressable key={item} onPress={() => { setTab(item); setError(""); if (item !== "Apps") setSelectedAppId(null); }} style={styles.tabItem}><Text style={[styles.tabGlyph, tab === item && styles.tabGlyphOn]}>{item === "Today" ? "⌂" : item === "Goals" ? "◎" : item === "Focus" ? "◷" : item === "Companion" ? "✦" : item === "Apps" ? "▦" : item === "Writing" ? "✎" : item === "Check-in" ? "♡" : item === "Reminders" ? "♧" : "◉"}</Text><Text style={[styles.tabLabel, tab === item && styles.tabLabelOn]}>{item}</Text></Pressable>)}</ScrollView>
     </>}
-    <Modal visible={!!modal} transparent animationType="fade" onRequestClose={() => setModal(null)}><KeyboardAvoidingView style={styles.modalShade} behavior={Platform.OS === "ios" ? "padding" : undefined}><View style={styles.modalCard}><Text style={styles.modalTitle}>{modal === "goal" ? "A goal worth growing" : modal === "task" ? "One small next step" : "A gentle reminder"}</Text><Text style={styles.muted}>{modal === "reminder" ? "We’ll set this for one hour from now." : "Keep it clear and achievable."}</Text><TextInput style={styles.modalInput} value={title} onChangeText={setTitle} placeholder={modal === "goal" ? "e.g. Build a morning routine" : modal === "task" ? "e.g. Write for 20 minutes" : "e.g. Take a screen break"} autoFocus/><View style={styles.modalActions}><Pressable onPress={() => { setModal(null); setTitle(""); }} style={styles.cancelButton}><Text style={styles.cancelText}>Cancel</Text></Pressable><ActionButton label={busy ? "Saving…" : "Save"} onPress={() => void saveItem()} disabled={busy || !title.trim()}/></View></View></KeyboardAvoidingView></Modal>
-    <Modal visible={connectionOpen} transparent animationType="fade" onRequestClose={() => setConnectionOpen(false)}><KeyboardAvoidingView style={styles.modalShade} behavior={Platform.OS === "ios" ? "padding" : undefined}><View style={styles.modalCard}><Text style={styles.modalTitle}>Connect OpenRouter</Text><Text style={styles.muted}>Your key is sent over HTTPS, tested, then encrypted on the Daywell server.</Text><Text style={styles.fieldLabel}>Model ID</Text><TextInput style={styles.modalInput} value={providerModel} onChangeText={setProviderModel} autoCapitalize="none" placeholder="openai/gpt-4o-mini"/><Text style={styles.fieldLabel}>OpenRouter API key</Text><TextInput style={styles.modalInput} value={providerKey} onChangeText={setProviderKey} secureTextEntry autoCapitalize="none" placeholder="sk-or-v1-…"/><View style={styles.modalActions}><Pressable onPress={() => { setProviderKey(""); setConnectionOpen(false); }} style={styles.cancelButton}><Text style={styles.cancelText}>Cancel</Text></Pressable><ActionButton label={busy ? "Testing and saving…" : "Test & connect"} onPress={() => void connectOpenRouter()} disabled={busy || !providerKey.trim() || !providerModel.trim()}/></View></View></KeyboardAvoidingView></Modal>
+    <Modal visible={showWelcome} transparent animationType="fade" onRequestClose={() => {}}><View style={styles.welcomeShade}><View style={styles.welcomeCard}><Text style={styles.heroKicker}>YOUR DAYWELL SPACE</Text><Text style={styles.cardTitle}>Welcome, {user?.name.split(" ")[0]}!</Text><Text style={styles.muted}>A quick guide to your personal workspace.</Text><Text style={styles.welcomeStep}><Text style={styles.welcomeStrong}>Today</Text>{"  ·  "}Check your tasks, goals, and reminders.</Text><Text style={styles.welcomeStep}><Text style={styles.welcomeStrong}>Companion</Text>{"  ·  "}Ask for help and watch replies stream in.</Text><Text style={styles.welcomeStep}><Text style={styles.welcomeStrong}>Account</Text>{"  ·  "}Connect your own AI provider and manage your profile.</Text><Pressable style={styles.actionButton} onPress={() => { if (user) void SecureStore.setItemAsync(`daywell_welcome_seen_${user.id}`, "1"); setShowWelcome(false); }}><Text style={styles.actionButtonText}>Get started</Text></Pressable></View></View></Modal>
+    <Modal visible={!!modal} transparent animationType="fade" onRequestClose={() => setModal(null)}><KeyboardAvoidingView style={styles.modalShade} behavior={Platform.OS === "ios" ? "padding" : undefined}><View style={styles.modalCard}><Text style={styles.modalTitle}>{modal === "goal" ? "A goal worth growing" : modal === "task" ? "One small next step" : "A gentle reminder"}</Text><Text style={styles.muted}>{modal === "reminder" ? "Choose when your phone should alert you." : "Keep it clear and achievable."}</Text><TextInput style={styles.modalInput} value={title} onChangeText={setTitle} placeholder={modal === "goal" ? "e.g. Build a morning routine" : modal === "task" ? "e.g. Write for 20 minutes" : "e.g. Take a screen break"} autoFocus/>{modal === "reminder" && <View style={styles.providerChoices}>{[[5,"5 min"],[15,"15 min"],[60,"1 hour"],[1440,"Tomorrow"]].map(([minutes,label]) => <Pressable key={minutes} onPress={() => setReminderDelay(Number(minutes))} style={[styles.providerChip, reminderDelay === minutes && styles.providerChipOn]}><Text style={[styles.providerChipText, reminderDelay === minutes && styles.providerChipTextOn]}>{label}</Text></Pressable>)}</View>}<View style={styles.modalActions}><Pressable onPress={() => { setModal(null); setTitle(""); }} style={styles.cancelButton}><Text style={styles.cancelText}>Cancel</Text></Pressable><ActionButton label={busy ? "Saving…" : "Save"} onPress={() => void saveItem()} disabled={busy || !title.trim()}/></View></View></KeyboardAvoidingView></Modal>
+    <Modal visible={connectionOpen} transparent animationType="fade" onRequestClose={() => setConnectionOpen(false)}><KeyboardAvoidingView style={styles.modalShade} behavior={Platform.OS === "ios" ? "padding" : undefined}><ScrollView contentContainerStyle={styles.modalScroll} keyboardShouldPersistTaps="handled"><View style={styles.modalCard}><Text style={styles.modalTitle}>Connect an AI provider</Text><Text style={styles.muted}>Your key is sent over HTTPS, tested, then encrypted on the Daywell server.</Text><Text style={styles.fieldLabel}>Provider</Text><View style={styles.providerChoices}>{AI_PROVIDERS.map(provider => <Pressable key={provider} onPress={() => { setProviderName(provider); setProviderModel(AI_DEFAULTS[provider]); }} style={[styles.providerChip, providerName === provider && styles.providerChipOn]}><Text style={[styles.providerChipText, providerName === provider && styles.providerChipTextOn]}>{provider}</Text></Pressable>)}</View><Text style={styles.fieldLabel}>Model ID</Text><TextInput style={styles.modalInput} value={providerModel} onChangeText={setProviderModel} autoCapitalize="none" placeholder={AI_DEFAULTS[providerName] || "provider/model"}/>{providerName === "Custom" && <><Text style={styles.fieldLabel}>HTTPS chat completions endpoint</Text><TextInput style={styles.modalInput} value={providerEndpoint} onChangeText={setProviderEndpoint} autoCapitalize="none" autoCorrect={false} placeholder="https://api.example.com/v1/chat/completions"/></>}<Text style={styles.fieldLabel}>{providerName} API key</Text><TextInput style={styles.modalInput} value={providerKey} onChangeText={setProviderKey} secureTextEntry autoCapitalize="none" placeholder="Paste API key"/><View style={styles.modalActions}><Pressable onPress={() => { setProviderKey(""); setConnectionOpen(false); }} style={styles.cancelButton}><Text style={styles.cancelText}>Cancel</Text></Pressable><ActionButton label={busy ? "Testing and saving…" : "Test & connect"} onPress={() => void connectOpenRouter()} disabled={busy || !providerKey.trim() || !providerModel.trim() || providerName === "Custom" && !providerEndpoint.trim()}/></View></View></ScrollView></KeyboardAvoidingView></Modal>
   </SafeAreaView></SafeAreaProvider>;
 }
 
@@ -429,22 +635,30 @@ function EmptyCard({ title, detail }: { title: string; detail: string }) {
   return <View style={styles.emptyCard}><Text style={styles.emptyTitle}>{title}</Text><Text style={styles.muted}>{detail}</Text></View>;
 }
 
+function TypingDots() {
+  const [phase] = useState(() => new Animated.Value(0));
+  useEffect(() => { const animation = Animated.loop(Animated.sequence([Animated.timing(phase, { toValue: 1, duration: 450, useNativeDriver: true }), Animated.timing(phase, { toValue: 0, duration: 450, useNativeDriver: true })])); animation.start(); return () => animation.stop(); }, [phase]);
+  return <View style={{ flexDirection: "row", gap: 5, paddingVertical: 7, paddingHorizontal: 3 }}>{[0, 1, 2].map(index => <Animated.View key={index} style={{ width: 6, height: 6, borderRadius: 3, backgroundColor: "#7883d7", opacity: phase.interpolate({ inputRange: [0, 1], outputRange: index === 1 ? [0.35, 1] : [0.8, 0.35] }), transform: [{ translateY: phase.interpolate({ inputRange: [0, 1], outputRange: index === 1 ? [0, -3] : [-2, 1] }) }] }}/>)}</View>;
+}
+
 const styles = StyleSheet.create({
-  safe: { flex: 1, backgroundColor: "#fbf8f3" }, flex: { flex: 1 }, center: { flex: 1, alignItems: "center", justifyContent: "center", gap: 12, backgroundColor: "#fbf8f3" },
+  safe: { flex: 1, backgroundColor: "#fbf8f3" }, flex: { flex: 1 }, center: { flex: 1, alignItems: "center", justifyContent: "center", gap: 12, backgroundColor: "#fbf8f3" }, welcomeShade: { flex: 1, justifyContent: "center", padding: 22, backgroundColor: "rgba(35,40,35,0.45)" }, welcomeCard: { backgroundColor: "#fffdf9", borderRadius: 22, padding: 22, gap: 11 }, welcomeStep: { color: "#77786f", fontSize: 12, lineHeight: 19, padding: 12, borderWidth: 1, borderColor: "#eee9e1", borderRadius: 12 }, welcomeStrong: { color: "#35443a", fontWeight: "700" },
+  landingWrap: { flexGrow: 1, justifyContent: "center", padding: 25, paddingTop: 50, paddingBottom: 35, backgroundColor: "#fbf8f3" }, landingCard: { backgroundColor: "#fff", borderRadius: 18, padding: 17, marginBottom: 18, borderWidth: 1, borderColor: "#eee9e1", gap: 9 }, landingCardTitle: { color: "#39443a", fontWeight: "700", fontSize: 14, marginBottom: 3 }, landingBullet: { color: "#727a6c", fontSize: 12 }, nativeLegal: { flexDirection: "row", flexWrap: "wrap", alignItems: "center", justifyContent: "center", gap: 5, marginTop: 15 }, legalLink: { color: "#55735a", textDecorationLine: "underline", fontSize: 12 }, consentRow: { flexDirection: "row", alignItems: "flex-start", gap: 9, marginBottom: 15 }, consentCheck: { width: 19, height: 19, borderWidth: 1, borderColor: "#aaa99f", borderRadius: 5, alignItems: "center", justifyContent: "center", marginTop: 1 }, consentCheckOn: { backgroundColor: "#55735a", borderColor: "#55735a" }, consentTick: { color: "#fff", fontSize: 13, fontWeight: "700" }, consentCopy: { flex: 1, color: "#77786f", fontSize: 11, lineHeight: 17 },
   authWrap: { flexGrow: 1, justifyContent: "center", padding: 26, paddingTop: 44 }, logoMark: { width: 46, height: 46, borderRadius: 16, backgroundColor: "#55735a", alignItems: "center", justifyContent: "center", marginBottom: 12 }, logoStar: { color: "#fffaf1", fontSize: 24 }, brand: { fontSize: 25, fontWeight: "700", color: "#2f3c32", letterSpacing: -1 }, brandDot: { color: "#d7966c" },
   authTitle: { fontSize: 30, lineHeight: 36, fontWeight: "700", color: "#303a32", marginTop: 38, letterSpacing: -0.6 }, authSubtitle: { fontSize: 15, lineHeight: 23, color: "#78776d", marginTop: 9, marginBottom: 24 }, authCard: { backgroundColor: "#fff", borderRadius: 22, padding: 20, borderWidth: 1, borderColor: "#eee9e1" }, field: { marginBottom: 16 }, fieldLabel: { color: "#444a40", fontSize: 13, fontWeight: "600", marginBottom: 8 }, input: { height: 50, borderWidth: 1, borderColor: "#e8e3da", borderRadius: 13, paddingHorizontal: 14, color: "#303a32", fontSize: 15, backgroundColor: "#fff" },
   previewDivider: { height: 1, backgroundColor: "#eee9e1", marginVertical: 17 }, previewNote: { color: "#928d81", fontSize: 11, lineHeight: 16, textAlign: "center", marginTop: 9 }, offlineBanner: { backgroundColor: "#f7e9ce", color: "#8b6a30", textAlign: "center", paddingVertical: 7, fontSize: 9, letterSpacing: 1, fontWeight: "700" },
   actionButton: { minHeight: 49, borderRadius: 13, backgroundColor: "#55735a", paddingHorizontal: 20, alignItems: "center", justifyContent: "center" }, actionButtonText: { color: "#fff", fontWeight: "700", fontSize: 15 }, disabled: { opacity: 0.55 }, switchText: { textAlign: "center", color: "#55735a", fontWeight: "600", marginTop: 18, fontSize: 13 }, demoText: { textAlign: "center", color: "#878479", marginTop: 17, fontSize: 13 }, error: { color: "#a44339", marginBottom: 13, fontSize: 13 },
-  topBar: { paddingHorizontal: 22, paddingTop: 13, paddingBottom: 15, flexDirection: "row", alignItems: "center", justifyContent: "space-between" }, eyebrow: { fontSize: 9, letterSpacing: 1.7, color: "#8b8a7c", fontWeight: "700" }, screenTitle: { fontSize: 26, color: "#303a32", fontWeight: "700", marginTop: 4, letterSpacing: -0.4 }, avatar: { width: 42, height: 42, borderRadius: 15, alignItems: "center", justifyContent: "center", backgroundColor: "#eee7da" }, avatarText: { color: "#526c57", fontWeight: "700" }, content: { paddingHorizontal: 20, paddingBottom: 28 }, errorBanner: { color: "#963f35", paddingHorizontal: 20, paddingBottom: 10, fontSize: 13 },
+  topBar: { paddingHorizontal: 22, paddingTop: 13, paddingBottom: 15, flexDirection: "row", alignItems: "center", justifyContent: "space-between" }, eyebrow: { fontSize: 9, letterSpacing: 1.7, color: "#8b8a7c", fontWeight: "700" }, screenTitle: { fontSize: 26, color: "#303a32", fontWeight: "700", marginTop: 4, letterSpacing: -0.4 }, avatar: { width: 42, height: 42, borderRadius: 15, alignItems: "center", justifyContent: "center", backgroundColor: "#eee7da" }, avatarText: { color: "#526c57", fontWeight: "700" }, content: { paddingHorizontal: 20, paddingBottom: 28 }, chatScroll: { backgroundColor: "#f7f7f8" }, chatContent: { flexGrow: 1, justifyContent: "flex-end", paddingHorizontal: 16, paddingBottom: 15 }, errorBanner: { color: "#963f35", paddingHorizontal: 20, paddingBottom: 10, fontSize: 13 },
   hero: { backgroundColor: "#e9ede4", padding: 22, borderRadius: 23, marginTop: 3, marginBottom: 15 }, heroKicker: { color: "#68816a", fontSize: 9, fontWeight: "700", letterSpacing: 1.5 }, heroTitle: { fontSize: 32, lineHeight: 36, color: "#35443a", fontWeight: "700", marginTop: 13, letterSpacing: -0.8 }, heroCopy: { color: "#727a6c", fontSize: 13, marginTop: 8 }, heroButton: { marginTop: 17, backgroundColor: "#55735a", alignSelf: "flex-start", paddingHorizontal: 15, paddingVertical: 10, borderRadius: 11 }, heroButtonText: { color: "#fff", fontWeight: "600", fontSize: 12 }, statsRow: { flexDirection: "row", gap: 9, marginBottom: 24 }, stat: { flex: 1, backgroundColor: "#fff", borderWidth: 1, borderColor: "#eee9e1", borderRadius: 15, paddingVertical: 14, paddingHorizontal: 12 }, statValue: { color: "#35443a", fontWeight: "700", fontSize: 21 }, statLabel: { color: "#89867d", fontSize: 10, marginTop: 4 },
   sectionTitleRow: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginTop: 15, marginBottom: 11 }, sectionTitle: { color: "#343c34", fontSize: 17, fontWeight: "700", letterSpacing: -0.2 }, sectionAction: { color: "#628066", fontSize: 12, fontWeight: "600" },
   taskRow: { backgroundColor: "#fff", minHeight: 56, borderRadius: 14, borderWidth: 1, borderColor: "#eee9e1", paddingHorizontal: 13, marginBottom: 8, flexDirection: "row", alignItems: "center", gap: 11 }, checkbox: { width: 21, height: 21, borderRadius: 7, borderWidth: 1.5, borderColor: "#d9d4ca", alignItems: "center", justifyContent: "center" }, checkboxDone: { borderColor: "#66836a", backgroundColor: "#66836a" }, check: { color: "#fff", fontSize: 13, fontWeight: "700" }, taskTitle: { flex: 1, color: "#454941", fontSize: 13 }, taskDone: { color: "#9c9a90", textDecorationLine: "line-through" }, taskPriority: { color: "#a49f91", fontSize: 10, textTransform: "capitalize" },
   goalCard: { flexDirection: "row", gap: 12, padding: 15, borderRadius: 16, backgroundColor: "#fff", borderWidth: 1, borderColor: "#eee9e1", marginBottom: 9 }, goalDot: { width: 10, height: 10, borderRadius: 5, backgroundColor: "#d6a783", marginTop: 5 }, cardTitle: { fontSize: 14, fontWeight: "700", color: "#3c433a", marginBottom: 4 }, muted: { color: "#87857b", fontSize: 12, lineHeight: 18 }, goalDescription: { color: "#77786f", fontSize: 12, lineHeight: 18, marginTop: 7 }, emptyCard: { borderWidth: 1, borderColor: "#ebe6dc", borderStyle: "dashed", borderRadius: 16, padding: 19, alignItems: "center", marginTop: 3, backgroundColor: "#fffdf9" }, emptyTitle: { color: "#41483f", fontWeight: "700", fontSize: 14, marginBottom: 5 },
   tabBar: { flexGrow: 0, borderTopWidth: 1, borderTopColor: "#eee9e1", backgroundColor: "#fffdf9", paddingTop: 9, paddingBottom: Platform.OS === "ios" ? 5 : 8 }, tabBarInner: { alignItems: "center" }, tabItem: { minWidth: 67, alignItems: "center", gap: 3 }, tabGlyph: { fontSize: 20, color: "#9a988d" }, tabGlyphOn: { color: "#55735a" }, tabLabel: { fontSize: 9, color: "#97958a" }, tabLabelOn: { color: "#55735a", fontWeight: "700" },
-  chatIntro: { alignItems: "center", backgroundColor: "#e9ede4", borderRadius: 19, padding: 18, marginTop: 4, marginBottom: 14 }, chatSymbol: { color: "#55735a", fontSize: 23, marginBottom: 8 }, message: { maxWidth: "88%", borderRadius: 16, padding: 13, marginBottom: 9 }, userMessage: { alignSelf: "flex-end", backgroundColor: "#55735a", borderBottomRightRadius: 5 }, assistantMessage: { alignSelf: "flex-start", backgroundColor: "#fff", borderWidth: 1, borderColor: "#eee9e1", borderBottomLeftRadius: 5 }, messageText: { color: "#41473f", fontSize: 13, lineHeight: 19 }, userMessageText: { color: "#fff", fontSize: 13, lineHeight: 19 }, chatComposer: { flexDirection: "row", alignItems: "flex-end", gap: 9, backgroundColor: "#fff", borderRadius: 16, borderWidth: 1, borderColor: "#e9e4dc", padding: 7, marginTop: 12, marginBottom: 22 }, chatInput: { flex: 1, minHeight: 40, maxHeight: 110, paddingHorizontal: 9, paddingTop: 10, color: "#343a33" }, sendButton: { width: 40, height: 40, borderRadius: 13, backgroundColor: "#55735a", alignItems: "center", justifyContent: "center" }, sendText: { color: "#fff", fontSize: 22, fontWeight: "700" },
+  chatIntro: { alignItems: "center", backgroundColor: "#e9ede4", borderRadius: 19, padding: 18, marginTop: 4, marginBottom: 14 }, chatWelcome: { flex: 1, alignItems: "center", justifyContent: "center", paddingHorizontal: 10, paddingBottom: 24 }, chatWelcomeMark: { width: 58, height: 58, borderRadius: 20, backgroundColor: "#e9ede4", alignItems: "center", justifyContent: "center", marginBottom: 18 }, chatWelcomeTitle: { fontSize: 22, fontWeight: "700", color: "#333b33", marginBottom: 9 }, chatSymbol: { color: "#55735a", fontSize: 23, marginBottom: 8 }, promptGrid: { width: "100%", flexDirection: "row", flexWrap: "wrap", gap: 8, marginTop: 20 }, promptChip: { flex: 1, minWidth: "45%", minHeight: 52, borderWidth: 1, borderColor: "#e8e6e1", borderRadius: 14, backgroundColor: "#fff", paddingHorizontal: 12, alignItems: "center", flexDirection: "row", gap: 6 }, promptChipText: { flex: 1, color: "#58635a", fontSize: 11, fontWeight: "600" }, promptArrow: { color: "#899487", fontSize: 14 }, message: { maxWidth: "88%", borderRadius: 19, paddingVertical: 12, paddingHorizontal: 15, marginBottom: 12 }, userMessage: { alignSelf: "flex-end", backgroundColor: "#55735a", borderBottomRightRadius: 6 }, assistantMessage: { alignSelf: "flex-start", backgroundColor: "#fff", borderWidth: 1, borderColor: "#eee9e1", borderBottomLeftRadius: 6 }, messageText: { color: "#41473f", fontSize: 14, lineHeight: 21 }, userMessageText: { color: "#fff", fontSize: 14, lineHeight: 21 }, chatComposer: { flexDirection: "row", alignItems: "flex-end", gap: 9, backgroundColor: "#fff", borderRadius: 20, borderWidth: 1, borderColor: "#e5e6e2", padding: 7, marginHorizontal: 13, marginTop: 7, marginBottom: 10, shadowColor: "#252d26", shadowOpacity: 0.06, shadowRadius: 8, elevation: 2 }, chatInput: { flex: 1, minHeight: 43, maxHeight: 120, paddingHorizontal: 11, paddingTop: 11, color: "#343a33", fontSize: 14 }, sendButton: { width: 40, height: 40, borderRadius: 14, backgroundColor: "#55735a", alignItems: "center", justifyContent: "center" }, sendDisabled: { backgroundColor: "#b8beb8" }, sendText: { color: "#fff", fontSize: 22, fontWeight: "700" },
+  mobileAppCard: { flexDirection: "row", alignItems: "center", gap: 12, backgroundColor: "#fff", borderWidth: 1, borderColor: "#eee9e1", borderRadius: 16, padding: 13, marginBottom: 9 }, mobileAppIcon: { width: 42, height: 42, borderRadius: 13, backgroundColor: "#e9ede4", alignItems: "center", justifyContent: "center" }, mobileAppGlyph: { color: "#55735a", fontSize: 20, fontWeight: "700" }, mobileAppCopy: { flex: 1, gap: 3 }, appPermissions: { fontSize: 9, color: "#91938a", lineHeight: 14, marginTop: 3 }, mobileAppButton: { paddingHorizontal: 13, paddingVertical: 9, borderRadius: 11, backgroundColor: "#55735a" }, mobileAppButtonText: { color: "#fff", fontSize: 11, fontWeight: "700" }, moduleInputCard: { backgroundColor: "#fff", borderWidth: 1, borderColor: "#eee9e1", borderRadius: 16, padding: 13, marginTop: 12, gap: 10, marginBottom: 12 }, moduleTitleInput: { minHeight: 47, borderWidth: 1, borderColor: "#e8e3da", backgroundColor: "#fff", borderRadius: 12, paddingHorizontal: 13, color: "#303a32", marginTop: 10 }, moduleBodyInput: { minHeight: 105, textAlignVertical: "top", borderWidth: 1, borderColor: "#e8e3da", backgroundColor: "#fff", borderRadius: 13, padding: 13, color: "#303a32", marginTop: 10, marginBottom: 8 }, appAIButton: { alignSelf: "flex-start", padding: 10, marginTop: 4 }, appAIText: { color: "#55735a", fontWeight: "700", fontSize: 12 }, moneyTotal: { backgroundColor: "#e9ede4", borderRadius: 13, padding: 13, marginTop: 12 }, mobileEntry: { flexDirection: "row", alignItems: "center", gap: 10, backgroundColor: "#fff", borderWidth: 1, borderColor: "#eee9e1", borderRadius: 13, padding: 12, marginBottom: 8 }, moduleCheck: { width: 28, height: 28, borderWidth: 1, borderColor: "#c4cbbf", borderRadius: 9, alignItems: "center", justifyContent: "center" }, moduleCheckOn: { backgroundColor: "#55735a", borderColor: "#55735a" }, moduleCheckText: { color: "#55735a", fontWeight: "700" }, removeAppButton: { padding: 14, alignItems: "center", marginTop: 12 }, removeAppText: { color: "#a34f42", fontWeight: "700", fontSize: 12 },
   reminderCard: { backgroundColor: "#fff", padding: 16, borderRadius: 16, borderWidth: 1, borderColor: "#eee9e1", marginBottom: 9 }, reminderTime: { color: "#79907b", fontWeight: "600", fontSize: 11, marginBottom: 8 },
   connectionCard: { backgroundColor: "#fff", flexDirection: "row", alignItems: "center", borderRadius: 15, borderWidth: 1, borderColor: "#eee9e1", padding: 14, marginBottom: 8 }, removeConnection: { color: "#a34f42", fontSize: 12, fontWeight: "600", padding: 8 }, connectionFeedback: { color: "#648068", fontSize: 12, lineHeight: 18, marginTop: 4, marginBottom: 8 },
   focusCard: { backgroundColor: "#e9ede4", borderRadius: 23, padding: 23, alignItems: "center", marginTop: 5, marginBottom: 17, gap: 13 }, focusClock: { color: "#35443a", fontWeight: "700", fontSize: 61, letterSpacing: -2 }, focusDiscard: { color: "#8f6250", fontSize: 12, fontWeight: "600", paddingVertical: 4 },
   writeIntro: { backgroundColor: "#e9ede4", borderRadius: 19, padding: 18, marginTop: 5, marginBottom: 12, gap: 8 }, writeForm: { backgroundColor: "#fff", borderRadius: 18, borderWidth: 1, borderColor: "#eee9e1", padding: 16 }, premiseInput: { minHeight: 100, textAlignVertical: "top", borderWidth: 1, borderColor: "#e8e3da", borderRadius: 13, padding: 13, color: "#303a32", fontSize: 14, marginBottom: 14, backgroundColor: "#fff" }, projectCard: { backgroundColor: "#fff", borderRadius: 17, borderWidth: 1, borderColor: "#eee9e1", padding: 16, marginBottom: 10 }, projectKicker: { color: "#79907b", fontWeight: "700", fontSize: 10, letterSpacing: 1, marginBottom: 8 }, projectContent: { color: "#55584f", fontSize: 13, lineHeight: 20, marginTop: 10 }, moodRow: { flexDirection: "row", flexWrap: "wrap", gap: 8, marginBottom: 12 }, moodChip: { borderWidth: 1, borderColor: "#e4dfd5", borderRadius: 20, paddingHorizontal: 14, paddingVertical: 9, backgroundColor: "#fff" }, moodChipOn: { backgroundColor: "#55735a", borderColor: "#55735a" }, moodText: { color: "#66675e", fontSize: 12 }, moodTextOn: { color: "#fff", fontWeight: "700" }, doneReminder: { alignSelf: "flex-start", marginTop: 13 }, accountCard: { backgroundColor: "#fff", padding: 19, borderRadius: 18, borderColor: "#eee9e1", borderWidth: 1, alignItems: "center", marginTop: 6, marginBottom: 12, gap: 6 }, accountRole: { color: "#789079", fontSize: 12, marginTop: 2 }, signOutButton: { minHeight: 49, borderRadius: 13, alignItems: "center", justifyContent: "center", borderWidth: 1, borderColor: "#d8bdb0", marginTop: 9 }, signOutText: { color: "#9c5543", fontWeight: "700" },
-  modalShade: { flex: 1, justifyContent: "center", padding: 22, backgroundColor: "rgba(35,40,35,0.38)" }, modalCard: { backgroundColor: "#fffdf9", borderRadius: 22, padding: 21 }, modalTitle: { color: "#343d35", fontSize: 21, fontWeight: "700", marginBottom: 5 }, modalInput: { height: 50, borderWidth: 1, borderColor: "#e7e2d9", borderRadius: 13, paddingHorizontal: 13, marginTop: 18, marginBottom: 17, color: "#303a32" }, modalActions: { flexDirection: "row", alignItems: "center", justifyContent: "flex-end", gap: 10 }, cancelButton: { minHeight: 47, justifyContent: "center", paddingHorizontal: 13 }, cancelText: { color: "#76756b", fontWeight: "600" },
+  modalShade: { flex: 1, justifyContent: "center", padding: 22, backgroundColor: "rgba(35,40,35,0.38)" }, modalScroll: { flexGrow: 1, justifyContent: "center" }, modalCard: { backgroundColor: "#fffdf9", borderRadius: 22, padding: 21 }, modalTitle: { color: "#343d35", fontSize: 21, fontWeight: "700", marginBottom: 5 }, modalInput: { height: 50, borderWidth: 1, borderColor: "#e7e2d9", borderRadius: 13, paddingHorizontal: 13, marginTop: 18, marginBottom: 17, color: "#303a32" }, modalActions: { flexDirection: "row", alignItems: "center", justifyContent: "flex-end", gap: 10 }, cancelButton: { minHeight: 47, justifyContent: "center", paddingHorizontal: 13 }, cancelText: { color: "#76756b", fontWeight: "600" }, providerChoices: { flexDirection: "row", flexWrap: "wrap", gap: 7, marginVertical: 9 }, providerChip: { borderRadius: 18, borderWidth: 1, borderColor: "#ded9d0", paddingHorizontal: 11, paddingVertical: 8, backgroundColor: "#fff" }, providerChipOn: { backgroundColor: "#55735a", borderColor: "#55735a" }, providerChipText: { color: "#64645d", fontSize: 12 }, providerChipTextOn: { color: "#fff", fontWeight: "700" },
 });

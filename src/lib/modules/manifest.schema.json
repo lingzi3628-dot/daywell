@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://daywell.app/schemas/module-manifest.v1.json",
+  "title": "Daywell Module Manifest",
+  "type": "object",
+  "required": ["id", "name", "version", "icon", "category", "entryBundleUrl", "signature", "minHostVersion", "permissions", "uiSlots", "routes", "dataSchema", "settingsSchema", "aiTools"],
+  "properties": {
+    "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{1,49}$" },
+    "name": { "type": "string", "minLength": 1, "maxLength": 80 },
+    "version": { "type": "string", "pattern": "^\\d+\\.\\d+\\.\\d+$" },
+    "icon": { "type": "string", "maxLength": 16 },
+    "category": { "enum": ["Daily Life", "Tasks", "Health", "Money", "Writing", "Research", "Learning", "Utilities"] },
+    "entryBundleUrl": { "type": "string", "pattern": "^builtin:[a-z0-9-]+$" },
+    "signature": { "type": "string", "minLength": 16 },
+    "minHostVersion": { "type": "string" },
+    "description": { "type": "string", "maxLength": 500 },
+    "sizeKb": { "type": "integer", "minimum": 0 },
+    "rating": { "type": "number", "minimum": 0, "maximum": 5 },
+    "developer": { "type": "string" },
+    "permissions": { "type": "array", "uniqueItems": true, "items": { "enum": ["storage", "tasks.read", "tasks.write", "ai", "notifications"] } },
+    "uiSlots": { "type": "array", "uniqueItems": true, "items": { "enum": ["sidebar", "dashboard", "command-palette", "settings", "search"] } },
+    "routes": { "type": "array", "items": { "type": "string" } },
+    "dataSchema": { "type": "object" },
+    "settingsSchema": { "type": "object" },
+    "aiTools": { "type": "array", "items": { "type": "string" } },
+    "changelog": { "type": "array", "items": { "type": "string" } },
+    "screenshots": { "type": "array", "items": { "type": "string", "format": "uri" } }
+  },
+  "additionalProperties": false
+}
