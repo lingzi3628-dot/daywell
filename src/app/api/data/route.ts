@@ -29,7 +29,15 @@ export async function POST(req: NextRequest) {
     if (resource === "projects") { if (!data.title?.trim()) return bad("A title is required."); const [item] = await db.insert(projects).values({ userId: uid, title: data.title.trim().slice(0, 200), type: data.type || "Story", genre: data.genre || "Contemporary", premise: data.premise || "", content: data.content || "" }).returning(); return NextResponse.json({ item }); }
     if (resource === "connections") { if (!data.provider || !data.model?.trim() || !data.apiKey?.trim()) return bad("Provider, model, and API key are required."); if (!supportedProviders.includes(data.provider)) return bad("Unsupported provider."); const endpoint = data.provider === "Custom" ? await validateEndpoint(String(data.endpoint || "")) : null; await callProvider({ provider: data.provider, model: data.model.trim(), apiKey: data.apiKey.trim(), endpoint }, "Reply with a short greeting to verify this API connection.", "Say hello in one short sentence.", [], 25000); await db.update(connections).set({ isActive: false }).where(eq(connections.userId, uid)); const [row] = await db.insert(connections).values({ userId: uid, provider: data.provider, model: data.model.trim().slice(0,200), endpoint, encryptedKey: encrypt(data.apiKey.trim()) }).returning(); return NextResponse.json({ item: { id: row.id, provider: row.provider, model: row.model, endpoint: row.endpoint, isActive: row.isActive, createdAt: row.createdAt } }); }
     return bad("Unknown resource.");
-  } catch (e) { return bad(e instanceof Error ? e.message : "Could not save. Check your input and try again."); }
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : "Could not save. Check your input and try again.";
+    if (msg.includes("ENCRYPTION_KEY")) {
+      // Server is missing its ENCRYPTION_KEY — encrypt() refused to run. The
+      // user can't fix this from the UI; an admin must set it in Vercel.
+      return bad("The server is missing its ENCRYPTION_KEY, so it can't safely store your API key. An admin needs to set ENCRYPTION_KEY (>=32 chars) in Vercel → Settings → Environment Variables, then redeploy.", 500);
+    }
+    return bad(msg);
+  }
 }
 export async function PATCH(req: NextRequest) {
   const user = await getUser(); if (!user) return bad("Unauthorized", 401);
@@ -41,7 +49,13 @@ export async function PATCH(req: NextRequest) {
     if (resource === "projects") { const [item] = await db.update(projects).set({ ...(data.title !== undefined ? { title: String(data.title).slice(0, 200) } : {}), ...(data.type !== undefined ? { type: data.type } : {}), ...(data.genre !== undefined ? { genre: data.genre } : {}), ...(data.premise !== undefined ? { premise: data.premise } : {}), ...(data.content !== undefined ? { content: data.content } : {}), updatedAt: new Date() }).where(and(eq(projects.id, id), eq(projects.userId, uid))).returning(); return item ? NextResponse.json({ item }) : bad("Not found.", 404); }
     if (resource === "connections") { const [existing] = await db.select().from(connections).where(and(eq(connections.id, id), eq(connections.userId, uid))).limit(1); if (!existing) return bad("Not found.", 404); const endpoint = data.endpoint !== undefined && existing.provider === "Custom" ? await validateEndpoint(String(data.endpoint)) : existing.endpoint; if (data.isActive || data.model !== undefined || data.apiKey?.trim() || data.endpoint !== undefined) await callProvider({ provider: existing.provider, model: data.model !== undefined ? String(data.model).trim() : existing.model, apiKey: data.apiKey?.trim() || decrypt(existing.encryptedKey), endpoint }, "Reply with a short greeting to verify this API connection.", "Say hello in one short sentence.", [], 25000); if (data.isActive) await db.update(connections).set({ isActive: false }).where(eq(connections.userId, uid)); const [item] = await db.update(connections).set({ ...(data.isActive !== undefined ? { isActive: !!data.isActive } : {}), ...(data.model !== undefined ? { model: String(data.model).trim().slice(0,200) } : {}), ...(data.apiKey?.trim() ? { encryptedKey: encrypt(data.apiKey.trim()) } : {}), endpoint }).where(and(eq(connections.id, id), eq(connections.userId, uid))).returning(); return NextResponse.json({ item: { id: item.id, provider: item.provider, model: item.model, endpoint: item.endpoint, isActive: item.isActive, createdAt: item.createdAt } }); }
     return bad("Unknown resource.");
-  } catch (e) { return bad(e instanceof Error ? e.message : "Could not update item."); }
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : "Could not update item.";
+    if (msg.includes("ENCRYPTION_KEY")) {
+      return bad("The server is missing its ENCRYPTION_KEY, so it can't safely store your API key. An admin needs to set ENCRYPTION_KEY (>=32 chars) in Vercel → Settings → Environment Variables, then redeploy.", 500);
+    }
+    return bad(msg);
+  }
 }
 export async function DELETE(req: NextRequest) {
   const user = await getUser(); if (!user) return bad("Unauthorized", 401);
